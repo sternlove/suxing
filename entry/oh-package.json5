@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Cyber-Twin 主机版 entry 模块",
+  "main": "",
+  "author": "oviora",
+  "license": "MIT",
+  "dependencies": {}
+}

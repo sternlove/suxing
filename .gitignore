@@ -1,0 +1,37 @@
+# 构建产物
+/build/
+/entry/build/
+/.hvigor/
+/.idea/
+/entry/.cxx/
+/entry/.preview/
+oh_modules/
+*.har
+*.hap
+*.app
+
+# 本地签名配置（含证书路径与密码，绝不入库）
+build-profile.json5
+entry/build-profile.json5
+
+# 3D 模型（体积大且涉及第三方素材，请按 README 自行准备）
+entry/src/main/resources/rawfile/*.glb
+
+# 本地模型 / 临时文件
+*.gguf
+*.log
+_*.py
+_*.json
+_shots/
+_entry_*.json
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 签名材料（证书/密钥库/Profile，绝不入库）
+/sign/
+*.p12
+*.p7b
+*.cer
+*.pem

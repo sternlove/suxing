@@ -1,0 +1,7 @@
+{
+  "accessibilityCapabilities": ["retrieve", "gesture"],
+  "accessibilityCapabilityRationale": "苏兴需要读取屏幕内容并模拟点击，才能替你在其它应用里自动操作（例如自动发微信）。",
+  "accessibilityAbilityTypes": ["all"],
+  "notificationTimeout": 200,
+  "targetBundleNames": []
+}

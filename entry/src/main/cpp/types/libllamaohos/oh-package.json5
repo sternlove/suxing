@@ -1,0 +1,6 @@
+{
+  "name": "libllamaohos.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "llama.cpp NAPI bridge for CyberTwin"
+}

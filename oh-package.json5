@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "cybertwin",
+  "version": "1.0.0",
+  "description": "Cyber-Twin 主机版：原生鸿蒙数字分身",
+  "main": "",
+  "author": "oviora",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
