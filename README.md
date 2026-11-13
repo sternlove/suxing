@@ -8,6 +8,22 @@
 
 ---
 
+## 界面
+
+| 主界面 | 3D 形象与聊天叠加 |
+|---|---|
+| ![主界面](docs/images/main-screen.jpg) | ![场景](docs/images/scene-early.jpg) |
+
+**口型同步**（闭嘴 vs 朗读中，13 倍放大自己的脸部区域）：
+
+![口型对比](docs/images/mouth-ab.jpg)
+
+**对话指令 → 系统分享**（说「用 QQ 发给李四：文件收到了」，解析出目标后唤起分享面板）：
+
+![分享面板](docs/images/share-panel.jpg)
+
+---
+
 ## 功能
 
 | 模块 | 说明 |
