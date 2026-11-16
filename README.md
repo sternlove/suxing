@@ -1,5 +1,7 @@
 # 苏兴 · HarmonyOS 原生 AI 数字分身
 
+> **English summary** — An on-device AI companion for HarmonyOS, written in ArkTS. All inference runs locally via llama.cpp (cross-compiled to OHOS) with a NAPI bridge, so it works fully offline; when online it can fall back to cloud APIs. Features a 3D avatar rendered with ArkGraphics3D that walks, sits, waves and moves its mouth in sync with speech, plus SQLite-backed memory with BM25 retrieval, a self-evolving persona, and natural-language commands that route to the system share sheet. See the [Known Limitations](#已知限制如实) section for what it deliberately does not do.
+
 一个跑在鸿蒙（HarmonyOS / OpenHarmony）上的**本地优先** AI 分身应用。全部推理在端侧完成，断网可用；联网时自动切换云端模型。
 
 3D 形象站在全屏场景里踱步、呼吸、说话时张口，聊天界面叠在场景之上。
