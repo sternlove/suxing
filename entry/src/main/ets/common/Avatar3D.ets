@@ -66,11 +66,17 @@ const LOG_TAG: string = 'CyberTwin';
 const FIXED_DT: number = 1 / 60;
 const MAX_STEPS: number = 5;
 
-/** 帧节拍：先按 60fps 跑，实测掉到 PERF_MIN_FPS 以下自动退回 30fps（同一进程内只降不升） */
+/**
+ * 帧节拍：先按 60fps 跑，实测掉到 PERF_MIN_FPS 以下自动退回 30fps（同一进程内只降不升）。
+ * 门槛 46 → 38：46 太敏感，连续对话时一次推理卡顿就会永久锁在 30fps 直到重启。
+ *
+ * 已知设计缺陷：「只降不升」意味着一次抖动会永久牺牲后续流畅度。彻底修法是加带冷却的
+ * 回升（连续 N 秒 fps>55 才尝试回 60），但会在临界点反复横跳，需要更谨慎的实测。
+ */
 const TICK_FAST: number = 16;
 const TICK_SLOW: number = 33;
 const PERF_WINDOW: number = 90;
-const PERF_MIN_FPS: number = 46;
+const PERF_MIN_FPS: number = 38;
 
 const GAIT_HZ: number = 1.0;
 const BREATH_PERIOD: number = 3.6;
