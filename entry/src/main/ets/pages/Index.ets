@@ -1930,6 +1930,13 @@ struct Index {
   }
 
   private async send(): Promise<void> {
+    // 防重入：生成中再次触发会让两路推理并发，lines / pendingIndex 会错位。
+    // 界面层虽然把「发送」换成了「停止」按钮，但快速双击仍可能穿过这个窗口，
+    // 且任何代码路径都能直接调用 send()。
+    if (this.generating) {
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'send ignored reason=generating');
+      return;
+    }
     const text = this.input.trim();
     if (text === '') {
       return;
