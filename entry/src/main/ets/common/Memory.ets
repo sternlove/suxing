@@ -1,5 +1,6 @@
 import { relationalStore } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
+import { fileIo as fs } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ChatMsg } from './CloudApi';
 import { buildRagBlock, MemoryHit, RagDoc, scoreDocs, RAG_MIN_SCORE, RAG_TOPK } from './Rag';
@@ -33,8 +34,26 @@ export interface MemRow {
   mode: string;
 }
 
+/** 会话：一条会话 = 一个互不串味的消息池 */
+export interface SessionRow {
+  id: number;
+  title: string;
+  createdTs: number;
+  updatedTs: number;
+  /** 该会话的消息条数 */
+  count: number;
+}
+
 export const DB_NAME: string = 'cybertwin_memory.db';
 export const TABLE_NAME: string = 'messages';
+/** 会话表：messages.session_id 指向它的 id */
+export const TABLE_SESSIONS: string = 'sessions';
+/** 老库升级时回填历史消息的那个会话的名字 */
+export const DEFAULT_SESSION_TITLE: string = '默认会话';
+/** 新建但还没说话 / 没改名的会话用这个名字，收到第一句 user 消息自动改成那句话 */
+export const NEW_SESSION_TITLE: string = '新会话';
+/** 会话标题自动生成时最多取多少字 */
+export const AUTO_TITLE_CHARS: number = 16;
 /** 启动时回填到消息列表的条数 */
 export const LOAD_LIMIT: number = 100;
 /** 送进模型的最近轮数（1 轮 = user + assistant） */
@@ -59,17 +78,221 @@ const SQL_CREATE: string = 'CREATE TABLE IF NOT EXISTS ' + TABLE_NAME + ' ('
   + 'role TEXT NOT NULL, '
   + 'text TEXT NOT NULL, '
   + 'ts INTEGER NOT NULL, '
-  + 'mode TEXT NOT NULL)';
+  + 'mode TEXT NOT NULL, '
+  + 'session_id INTEGER NOT NULL DEFAULT 0)';
 const SQL_INDEX: string = 'CREATE INDEX IF NOT EXISTS idx_messages_ts ON ' + TABLE_NAME + ' (ts)';
+const SQL_INDEX_SESSION: string =
+  'CREATE INDEX IF NOT EXISTS idx_messages_session ON ' + TABLE_NAME + ' (session_id, ts)';
+const SQL_CREATE_SESSIONS: string = 'CREATE TABLE IF NOT EXISTS ' + TABLE_SESSIONS + ' ('
+  + 'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+  + 'title TEXT NOT NULL, '
+  + 'created_ts INTEGER NOT NULL, '
+  + 'updated_ts INTEGER NOT NULL)';
+/**
+ * 迁移语句：老库（没 session_id 列）靠它补列，已有该列的库会抛 duplicate column name，
+ * 由 migrateSessions 吞掉当「已迁移」处理 —— 比 PRAGMA 探测稳，不依赖 RDB 是否支持 pragma 查询。
+ */
+const SQL_MIGRATE_SESSION_COL: string =
+  'ALTER TABLE ' + TABLE_NAME + ' ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0';
 
 export class ChatMemory {
   private store: relationalStore.RdbStore | undefined = undefined;
   private dbDir: string = '';
   /** 最近一次检索真正回捞进 BM25 的候选行数（面板显示「候选 M 条」，M = min(库内总数, RAG_CANDIDATES)） */
   private pool: number = 0;
+  /** 当前会话 id：append / loadRecent / search 默认都只碰这个会话 */
+  private cur: number = 0;
+  /** 全库检索开关（跨会话）；默认关，避免话题串味 */
+  private allScope: boolean = false;
+  /** 本次启动迁移了多少条老消息到默认会话（面板/日志要报） */
+  private migrated: number = 0;
 
   isReady(): boolean {
     return this.store !== undefined;
+  }
+
+  /** 当前会话 id（0 = 还没定下来） */
+  currentSessionId(): number {
+    return this.cur;
+  }
+
+  /**
+   * 切会话：只改存库/检索的落点，不动 UI。
+   * 顺手把 updated_ts 顶到最新 —— 会话列表按它排序，重启后也据此恢复到上次用的那个。
+   */
+  async setCurrentSession(id: number): Promise<boolean> {
+    if (id <= 0) {
+      return false;
+    }
+    this.cur = id;
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return false;
+    }
+    try {
+      const args: Array<relationalStore.ValueType> = [Date.now(), id];
+      await st.executeSql('UPDATE ' + TABLE_SESSIONS + ' SET updated_ts = ? WHERE id = ?', args);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session switch id=%{public}d', id);
+      return true;
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session switch failed: %{public}s', (e as Error).message);
+      return false;
+    }
+  }
+
+  /** 全库检索开关：开 = 跨会话，关 = 只当前会话（默认） */
+  setGlobalSearch(on: boolean): void {
+    this.allScope = on;
+    hilog.info(MEM_DOMAIN, MEM_TAG, 'session scope=%{public}s', on ? 'all' : 'session');
+  }
+
+  globalSearch(): boolean {
+    return this.allScope;
+  }
+
+  /** 本次启动迁移的旧消息条数 */
+  migratedRows(): number {
+    return this.migrated;
+  }
+
+  /** 全部会话，最近有动静的在前 */
+  async listSessions(): Promise<SessionRow[]> {
+    const out: SessionRow[] = [];
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return out;
+    }
+    try {
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT s.id AS id, s.title AS title, s.created_ts AS created_ts, s.updated_ts AS updated_ts, '
+          + '(SELECT COUNT(*) FROM ' + TABLE_NAME + ' m WHERE m.session_id = s.id) AS cnt '
+          + 'FROM ' + TABLE_SESSIONS + ' s ORDER BY s.updated_ts DESC, s.id DESC');
+      try {
+        const ciId: number = rs.getColumnIndex('id');
+        const ciTitle: number = rs.getColumnIndex('title');
+        const ciCreated: number = rs.getColumnIndex('created_ts');
+        const ciUpdated: number = rs.getColumnIndex('updated_ts');
+        const ciCnt: number = rs.getColumnIndex('cnt');
+        while (rs.goToNextRow()) {
+          const row: SessionRow = {
+            id: rs.getLong(ciId),
+            title: rs.getString(ciTitle),
+            createdTs: rs.getLong(ciCreated),
+            updatedTs: rs.getLong(ciUpdated),
+            count: rs.getLong(ciCnt)
+          };
+          out.push(row);
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session list failed: %{public}s', (e as Error).message);
+    }
+    return out;
+  }
+
+  async countSessions(): Promise<number> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return 0;
+    }
+    try {
+      const rs: relationalStore.ResultSet =
+        await st.querySql('SELECT COUNT(*) AS c FROM ' + TABLE_SESSIONS);
+      try {
+        if (rs.goToFirstRow()) {
+          return rs.getLong(rs.getColumnIndex('c'));
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session count failed: %{public}s', (e as Error).message);
+    }
+    return 0;
+  }
+
+  /** 新建会话，返回新 id（0 = 失败） */
+  async createSession(title: string): Promise<number> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return 0;
+    }
+    const t: string = title.trim() === '' ? NEW_SESSION_TITLE : title.trim();
+    const now: number = Date.now();
+    try {
+      const vb: relationalStore.ValuesBucket = {
+        'title': t,
+        'created_ts': now,
+        'updated_ts': now
+      };
+      const id: number = await st.insert(TABLE_SESSIONS, vb);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session create id=%{public}d title=[%{public}s]', id, t);
+      return id;
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session create failed: %{public}s', (e as Error).message);
+      return 0;
+    }
+  }
+
+  async renameSession(id: number, title: string): Promise<boolean> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined || id <= 0) {
+      return false;
+    }
+    const t: string = title.trim();
+    if (t === '') {
+      hilog.warn(MEM_DOMAIN, MEM_TAG, 'session rename refused reason=empty id=%{public}d', id);
+      return false;
+    }
+    try {
+      const vb: relationalStore.ValuesBucket = { 'title': t };
+      const pred: relationalStore.RdbPredicates = new relationalStore.RdbPredicates(TABLE_SESSIONS);
+      pred.equalTo('id', id);
+      const rows: number = await st.update(vb, pred);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session rename id=%{public}d rows=%{public}d title=[%{public}s]',
+        id, rows, t);
+      return rows > 0;
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session rename failed: %{public}s', (e as Error).message);
+      return false;
+    }
+  }
+
+  /**
+   * 删会话：连同它的消息一起删。
+   * 至少保留一个会话 —— 删到只剩一个时直接拒绝（UI 也会先挡一次，这里是第二道闸）。
+   */
+  async deleteSession(id: number): Promise<boolean> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined || id <= 0) {
+      return false;
+    }
+    const total: number = await this.countSessions();
+    if (total <= 1) {
+      hilog.warn(MEM_DOMAIN, MEM_TAG, 'session delete refused reason=keep-one total=%{public}d', total);
+      return false;
+    }
+    try {
+      const pMsg: relationalStore.RdbPredicates = new relationalStore.RdbPredicates(TABLE_NAME);
+      pMsg.equalTo('session_id', id);
+      const msgRows: number = await st.delete(pMsg);
+      const pSes: relationalStore.RdbPredicates = new relationalStore.RdbPredicates(TABLE_SESSIONS);
+      pSes.equalTo('id', id);
+      const rows: number = await st.delete(pSes);
+      if (this.cur === id) {
+        const rest: SessionRow[] = await this.listSessions();
+        this.cur = rest.length > 0 ? rest[0].id : 0;
+      }
+      hilog.info(MEM_DOMAIN, MEM_TAG,
+        'session delete id=%{public}d rows=%{public}d messages=%{public}d current=%{public}d',
+        id, rows, msgRows, this.cur);
+      return rows > 0;
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session delete failed: %{public}s', (e as Error).message);
+      return false;
+    }
   }
 
   /** 上一次检索的候选池条数；还没检索过是 0 */
@@ -100,10 +323,17 @@ export class ChatMemory {
       const st: relationalStore.RdbStore = await relationalStore.getRdbStore(ctx, cfg);
       await st.executeSql(SQL_CREATE);
       await st.executeSql(SQL_INDEX);
+      await st.executeSql(SQL_CREATE_SESSIONS);
       this.store = st;
+      // 顺序死规矩：先补 session_id 列（migrateSessions），再建带该列的索引 ——
+      // 老库上先建索引会以 no such column 失败，整条 init 就废了（已真机踩到）
+      await this.migrateSessions(st);
+      await st.executeSql(SQL_INDEX_SESSION);
       const rows: number = await this.count();
-      hilog.info(MEM_DOMAIN, MEM_TAG, 'memory ready path=%{public}s table=%{public}s rows=%{public}d',
-        this.dbPath(), TABLE_NAME, rows);
+      const ses: number = await this.countSessions();
+      hilog.info(MEM_DOMAIN, MEM_TAG,
+        'memory ready path=%{public}s table=%{public}s rows=%{public}d sessions=%{public}d current=%{public}d migrated=%{public}d',
+        this.dbPath(), TABLE_NAME, rows, ses, this.cur, this.migrated);
       return true;
     } catch (e) {
       hilog.error(MEM_DOMAIN, MEM_TAG, 'memory init failed: %{public}s', (e as Error).message);
@@ -111,16 +341,26 @@ export class ChatMemory {
     }
   }
 
-  /** 追加一条。role=user 的 mode 记 user，assistant 的记实际应答档位 */
+  /**
+   * 追加一条到当前会话。role=user 的 mode 记 user，assistant 的记实际应答档位。
+   * 写入同时把会话的 updated_ts 顶新，并在会话还是「新会话」时用这句话当标题。
+   */
   async append(role: string, text: string, mode: string): Promise<boolean> {
     const st: relationalStore.RdbStore | undefined = this.store;
     if (st === undefined || text === '') {
       return false;
     }
+    const sid: number = this.cur;
+    const now: number = Date.now();
     try {
-      const args: Array<relationalStore.ValueType> = [role, text, Date.now(), mode];
+      const args: Array<relationalStore.ValueType> = [role, text, now, mode, sid];
       await st.executeSql(
-        'INSERT INTO ' + TABLE_NAME + ' (role, text, ts, mode) VALUES (?, ?, ?, ?)', args);
+        'INSERT INTO ' + TABLE_NAME + ' (role, text, ts, mode, session_id) VALUES (?, ?, ?, ?, ?)', args);
+      const args2: Array<relationalStore.ValueType> = [now, sid];
+      await st.executeSql('UPDATE ' + TABLE_SESSIONS + ' SET updated_ts = ? WHERE id = ?', args2);
+      if (role === 'user') {
+        await this.autoTitle(sid, text);
+      }
       return true;
     } catch (e) {
       hilog.error(MEM_DOMAIN, MEM_TAG, 'memory append failed: %{public}s', (e as Error).message);
@@ -128,7 +368,136 @@ export class ChatMemory {
     }
   }
 
-  /** 最近 limit 条，按时间正序返回（旧 → 新，直接喂 List） */
+  /** 会话还叫「新会话」时，拿第一句用户消息当标题；手改过的名字一律不动 */
+  private async autoTitle(sid: number, text: string): Promise<void> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined || sid <= 0) {
+      return;
+    }
+    try {
+      const args: Array<relationalStore.ValueType> = [sid];
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT title FROM ' + TABLE_SESSIONS + ' WHERE id = ?', args);
+      let title: string = '';
+      try {
+        if (rs.goToFirstRow()) {
+          title = rs.getString(rs.getColumnIndex('title'));
+        }
+      } finally {
+        rs.close();
+      }
+      if (title !== NEW_SESSION_TITLE) {
+        return;
+      }
+      let flat: string = text.split('\n').join(' ').split('\r').join(' ').trim();
+      if (flat.length > AUTO_TITLE_CHARS) {
+        flat = flat.substring(0, AUTO_TITLE_CHARS);
+      }
+      if (flat === '') {
+        return;
+      }
+      await this.renameSession(sid, flat);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session auto title id=%{public}d title=[%{public}s]', sid, flat);
+    } catch (e) {
+      hilog.warn(MEM_DOMAIN, MEM_TAG, 'session auto title failed: %{public}s', (e as Error).message);
+    }
+  }
+
+  /**
+   * 建库后的会话迁移：补 session_id 列 → 至少一个会话 → 把 session_id=0 的老消息归进默认会话。
+   * 绝不删老数据：老行只是被填上默认会话的 id。
+   */
+  private async migrateSessions(st: relationalStore.RdbStore): Promise<void> {
+    let added: boolean = false;
+    try {
+      await st.executeSql(SQL_MIGRATE_SESSION_COL);
+      added = true;
+    } catch (e) {
+      // 列已存在：SQLite 抛 duplicate column name，这是「已迁移过」的正常路径
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session column already present: %{public}s',
+        (e as Error).message);
+    }
+    let total: number = await this.countSessions();
+    if (total === 0) {
+      const id: number = await this.createSession(DEFAULT_SESSION_TITLE);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session default created id=%{public}d', id);
+      total = await this.countSessions();
+    }
+    const defId: number = await this.firstSessionId();
+    let legacy: number = 0;
+    try {
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT COUNT(*) AS c FROM ' + TABLE_NAME + ' WHERE session_id = 0 OR session_id IS NULL');
+      try {
+        if (rs.goToFirstRow()) {
+          legacy = rs.getLong(rs.getColumnIndex('c'));
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session legacy count failed: %{public}s', (e as Error).message);
+    }
+    if (legacy > 0 && defId > 0) {
+      const args: Array<relationalStore.ValueType> = [defId];
+      await st.executeSql(
+        'UPDATE ' + TABLE_NAME + ' SET session_id = ? WHERE session_id = 0 OR session_id IS NULL', args);
+    }
+    this.migrated = legacy;
+    this.cur = await this.latestSessionId();
+    if (this.cur <= 0) {
+      this.cur = defId;
+    }
+    hilog.info(MEM_DOMAIN, MEM_TAG,
+      'session migrate addedColumn=%{public}s legacyRows=%{public}d sessions=%{public}d default=%{public}d current=%{public}d',
+      '' + added, legacy, total, defId, this.cur);
+  }
+
+  /** 最早建的那个会话（老消息的归属，也是「默认会话」） */
+  private async firstSessionId(): Promise<number> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return 0;
+    }
+    try {
+      const rs: relationalStore.ResultSet =
+        await st.querySql('SELECT MIN(id) AS m FROM ' + TABLE_SESSIONS);
+      try {
+        if (rs.goToFirstRow()) {
+          return rs.getLong(rs.getColumnIndex('m'));
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session first failed: %{public}s', (e as Error).message);
+    }
+    return 0;
+  }
+
+  /** 上次动过的会话（重启后接着用） */
+  private async latestSessionId(): Promise<number> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return 0;
+    }
+    try {
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT id FROM ' + TABLE_SESSIONS + ' ORDER BY updated_ts DESC, id DESC LIMIT 1');
+      try {
+        if (rs.goToFirstRow()) {
+          return rs.getLong(rs.getColumnIndex('id'));
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'session latest failed: %{public}s', (e as Error).message);
+    }
+    return 0;
+  }
+
+  /** 当前会话的最近 limit 条，按时间正序返回（旧 → 新，直接喂 List） */
   async loadRecent(limit: number): Promise<MemRow[]> {
     const rows: MemRow[] = [];
     const st: relationalStore.RdbStore | undefined = this.store;
@@ -136,9 +505,10 @@ export class ChatMemory {
       return rows;
     }
     try {
-      const args: Array<relationalStore.ValueType> = [limit];
+      const args: Array<relationalStore.ValueType> = [this.cur, limit];
       const rs: relationalStore.ResultSet = await st.querySql(
-        'SELECT id, role, text, ts, mode FROM ' + TABLE_NAME + ' ORDER BY id DESC LIMIT ?', args);
+        'SELECT id, role, text, ts, mode FROM ' + TABLE_NAME
+          + ' WHERE session_id = ? ORDER BY id DESC LIMIT ?', args);
       try {
         const ciId: number = rs.getColumnIndex('id');
         const ciRole: number = rs.getColumnIndex('role');
@@ -165,7 +535,10 @@ export class ChatMemory {
     return rows;
   }
 
-  /** 回捞检索候选集（最近 limit 条，时间正序）；库里没有 store 时返回空 */
+  /**
+   * 回捞检索候选集（最近 limit 条，时间正序）。
+   * 默认只回捞当前会话的行：跨会话检索会让「会话 A 说的口味」跑进会话 B 的 prompt。
+   */
   private async loadDocs(limit: number): Promise<RagDoc[]> {
     const docs: RagDoc[] = [];
     const st: relationalStore.RdbStore | undefined = this.store;
@@ -173,9 +546,13 @@ export class ChatMemory {
       return docs;
     }
     try {
-      const args: Array<relationalStore.ValueType> = [limit];
-      const rs: relationalStore.ResultSet = await st.querySql(
-        'SELECT id, role, text, ts FROM ' + TABLE_NAME + ' ORDER BY id DESC LIMIT ?', args);
+      const args: Array<relationalStore.ValueType> = this.allScope
+        ? [limit] : [this.cur, limit];
+      const sql: string = this.allScope
+        ? 'SELECT id, role, text, ts FROM ' + TABLE_NAME + ' ORDER BY id DESC LIMIT ?'
+        : 'SELECT id, role, text, ts FROM ' + TABLE_NAME
+          + ' WHERE session_id = ? ORDER BY id DESC LIMIT ?';
+      const rs: relationalStore.ResultSet = await st.querySql(sql, args);
       try {
         const ciId: number = rs.getColumnIndex('id');
         const ciRole: number = rs.getColumnIndex('role');
@@ -224,8 +601,8 @@ export class ChatMemory {
     }
     const hits: MemoryHit[] = scoreDocs(q, pool, topK);
     hilog.info(MEM_DOMAIN, MEM_TAG,
-      'memory search query=[%{public}s] candidates=%{public}d pool=%{public}d hits=%{public}d',
-      q.substring(0, 30), this.pool, pool.length, hits.length);
+      'memory search query=[%{public}s] scope=%{public}s session=%{public}d candidates=%{public}d pool=%{public}d hits=%{public}d',
+      q.substring(0, 30), this.allScope ? 'all' : 'session', this.cur, this.pool, pool.length, hits.length);
     let top: number = 0;
     for (const h of hits) {
       if (h.score > top) {
@@ -326,7 +703,69 @@ export class ChatMemory {
     return 0;
   }
 
-  /** 清空全部记录（保留表结构与自增序列，避免 id 复用干扰排序） */
+  /** 当前会话的全部消息，按时间正序（导出用；limit 只是防呆上限） */
+  async loadAll(limit: number): Promise<MemRow[]> {
+    const rows: MemRow[] = [];
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return rows;
+    }
+    try {
+      const args: Array<relationalStore.ValueType> = [this.cur, limit];
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT id, role, text, ts, mode FROM ' + TABLE_NAME
+          + ' WHERE session_id = ? ORDER BY id ASC LIMIT ?', args);
+      try {
+        const ciId: number = rs.getColumnIndex('id');
+        const ciRole: number = rs.getColumnIndex('role');
+        const ciText: number = rs.getColumnIndex('text');
+        const ciTs: number = rs.getColumnIndex('ts');
+        const ciMode: number = rs.getColumnIndex('mode');
+        while (rs.goToNextRow()) {
+          const row: MemRow = {
+            id: rs.getLong(ciId),
+            role: rs.getString(ciRole),
+            text: rs.getString(ciText),
+            ts: rs.getLong(ciTs),
+            mode: rs.getString(ciMode)
+          };
+          rows.push(row);
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'memory loadAll failed: %{public}s', (e as Error).message);
+    }
+    return rows;
+  }
+
+  /**
+   * 整库备份：用 RDB 自带的 backup() 出一份一致性快照（边写边拷贝可能拷到半个事务），
+   * 再把快照复制到调用方给的路径（沙箱内可分享位置）。失败一律抛错，不静默。
+   */
+  async backupDatabase(destPath: string): Promise<string> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      throw new Error('数据库未就绪（init 失败或还没跑）');
+    }
+    const snapName: string = 'cybertwin_backup.db';
+    await st.backup(snapName);
+    const src: string = (this.dbDir === '' ? '.' : this.dbDir) + '/' + snapName;
+    if (!fs.accessSync(src)) {
+      throw new Error('备份快照没生成：' + src);
+    }
+    fs.copyFileSync(src, destPath);
+    const size: number = fs.statSync(destPath).size;
+    if (size <= 0) {
+      throw new Error('备份文件是空的：' + destPath);
+    }
+    hilog.info(MEM_DOMAIN, MEM_TAG, 'memory backup src=%{public}s dest=%{public}s bytes=%{public}d',
+      src, destPath, size);
+    return destPath;
+  }
+
+  /** 清空全部记录（保留表结构与自增序列，避免 id 复用干扰排序）；会话本身保留 */
   async clear(): Promise<boolean> {
     const st: relationalStore.RdbStore | undefined = this.store;
     if (st === undefined) {
@@ -341,6 +780,59 @@ export class ChatMemory {
       return false;
     }
   }
+}
+
+function two(n: number): string {
+  return n < 10 ? '0' + n : '' + n;
+}
+
+/** 日志/文件名用时间戳：2026-11-17 21:36:05 */
+export function formatStamp(ts: number): string {
+  const d: Date = new Date(ts);
+  return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' '
+    + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+}
+
+/** 会话列表用短时间：11-17 21:36 */
+export function formatShort(ts: number): string {
+  const d: Date = new Date(ts);
+  return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes());
+}
+
+/** 文件名安全化：去掉路径分隔符与 Windows/手机都不吃的字符 */
+export function safeFileStem(title: string): string {
+  const raw: string = title.trim() === '' ? 'session' : title.trim();
+  let out: string = '';
+  for (let i: number = 0; i < raw.length && out.length < 24; i++) {
+    const ch: string = raw.charAt(i);
+    if ('/\\:*?"<>| '.indexOf(ch) >= 0) {
+      continue;
+    }
+    out += ch;
+  }
+  return out === '' ? 'session' : out;
+}
+
+/**
+ * 会话导出成 Markdown：一级标题是会话名，正文按时间顺序一行一句，
+ * 用户侧署名「先生」、分身侧署名「苏兴」（与人格底线一致）。
+ */
+export function buildSessionMarkdown(title: string, rows: MemRow[], exportedTs: number): string {
+  const head: string = title.trim() === '' ? '苏兴会话' : title.trim();
+  const out: string[] = ['# ' + head, ''];
+  let used: number = 0;
+  for (const r of rows) {
+    const body: string = r.text.split('\r').join('');
+    if (body.trim() === '') {
+      continue;
+    }
+    out.push((r.role === 'user' ? '**先生：** ' : '**苏兴：** ') + body);
+    out.push('');
+    used++;
+  }
+  out.push('---');
+  out.push('由苏兴导出 · ' + formatStamp(exportedTs) + ' · 共 ' + used + ' 条');
+  return out.join('\n');
 }
 
 /** 只取最近 rounds 轮（2*rounds 条），多传一截也截断 */

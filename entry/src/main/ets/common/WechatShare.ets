@@ -101,6 +101,35 @@ export async function shareTextAsFile(ctx: common.UIAbilityContext, text: string
   return uri;
 }
 
+/**
+ * 把一个已经落盘的文件塞进系统分享面板（会话导出 .md / 数据库备份 .db 走这条）。
+ *
+ * 与 shareTextAsFile 的分工：那条链路是「文本 → 固定文件名 .txt → 微信」，被对话指令复用，
+ * 不能动；这里是「文件已在沙箱里 → 按调用方给的文件名与 utd 分享」，互不影响。
+ * 文件不存在直接抛错 —— 调用方要把原因写进面板/日志，不允许静默。
+ */
+export async function shareFileAt(ctx: common.UIAbilityContext, path: string, title: string,
+                                 utd: string): Promise<string> {
+  if (!fs.accessSync(path)) {
+    throw new Error('文件不存在：' + path);
+  }
+  const size: number = fs.statSync(path).size;
+  if (size <= 0) {
+    throw new Error('文件是空的：' + path);
+  }
+  const uri: string = fileUri.getUriFromPath(path);
+  const record: systemShare.SharedRecord = {
+    utd: utd,
+    uri: uri,
+    title: title,
+    description: '由苏兴导出'
+  };
+  await showPanel(ctx, buildData(record), 'file');
+  hilog.info(TWIN_DOMAIN, TWIN_TAG, 'share file panel shown uri=%{public}s bytes=%{public}d',
+    uri, size);
+  return uri;
+}
+
 /** 路径 2 前半：写系统剪贴板 */
 export async function copyText(text: string): Promise<void> {
   const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);

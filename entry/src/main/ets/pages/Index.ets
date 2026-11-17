@@ -14,7 +14,14 @@ import {
   SendIntent,
   WECHAT_CONTACT
 } from '../common/TwinProto';
-import { sharePlainText, shareTextWithTitle, shareTextAsFile, copyText, launchWechat } from '../common/WechatShare';
+import {
+  sharePlainText,
+  shareTextWithTitle,
+  shareTextAsFile,
+  shareFileAt,
+  copyText,
+  launchWechat
+} from '../common/WechatShare';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { preferences } from '@kit.ArkData';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -28,16 +35,22 @@ import {
   ChatMemory,
   ChatTurn,
   MemRow,
+  SessionRow,
   LOAD_LIMIT,
   HISTORY_ROUNDS,
   LOCAL_PROMPT_CHARS,
   CLOUD_PROMPT_CHARS,
+  DEFAULT_SESSION_TITLE,
   recentTurns,
   buildLocalPromptPack,
   PromptPack,
   buildCloudMessages,
-  describeTurns
+  describeTurns,
+  formatShort,
+  safeFileStem,
+  buildSessionMarkdown
 } from '../common/Memory';
+import { Palette, THEME_DARK, THEME_LIGHT, paletteOf, themeLabel } from '../common/Theme';
 import { MemoryHit, RAG_TOPK, buildRagBlock, pickFresh, oneLine } from '../common/Rag';
 import {
   PROACTIVE_TICK_MS,
@@ -93,6 +106,12 @@ const KEY_API_KEY: string = 'cloud_api_key';
 const KEY_MODEL: string = 'cloud_model';
 /** 上次导入的模型（沙箱绝对路径），重启后直接接上，不用再选一次 */
 const KEY_MODEL_PATH: string = 'model_path';
+/** UI 主题：dark / light（3D 层不跟随，它永远是深色全息场景） */
+const KEY_THEME: string = 'ui_theme';
+/** 导出落盘目录（沙箱内，可被系统分享读走） */
+const EXPORT_DIR: string = 'export';
+/** 单次导出最多带多少条消息（防呆，正常会话远达不到） */
+const EXPORT_MAX_ROWS: number = 5000;
 const DEFAULT_MODEL: string = 'deepseek-chat';
 /** system 提示的唯一来源是 Persona.composeSystemPrompt（底线人格写死在 Persona.BASE_PERSONA） */
 const LOG_DOMAIN: number = 0xC0DE;
@@ -254,6 +273,19 @@ struct Index {
   @State emoTip: string = '平稳';
   @State emoFace: string = '😐';
 
+  /** 💬 多会话：会话面板开关、会话列表、当前会话 id / 标题、正在改名的会话 */
+  @State showSessions: boolean = false;
+  @State sessions: SessionRow[] = [];
+  @State curSessionId: number = 0;
+  @State curTitle: string = '默认会话';
+  @State renamingId: number = 0;
+  @State renameText: string = '';
+  /** 🔍 全库检索（跨会话）开关，默认关：开着会把别的话题串进本轮 prompt */
+  @State globalSearch: boolean = false;
+  /** 🎨 主题：true 深色（默认）/ false 浅色；真值来源是 this.theme + preferences */
+  @State themeDark: boolean = true;
+  /** 📤 导出/备份的结果回显（面板里那行，成功给路径与大小，失败给原因） */
+  @State expNote: string = '（还没导出）';
   /** 形象：0 写实 Avatar.glb / 1 动漫 nova.glb（两个模型都在 rawfile 里，可随时切） */
   @State avatarKind: number = DEFAULT_MODEL_KIND;
   /** 3D 背景层自报状态/错误；空串表示无话可说 */
@@ -270,6 +302,8 @@ struct Index {
   private pendingIndex: number = -1;
   private pref: preferences.Preferences | undefined = undefined;
   private modelPath: string = '';
+  /** 当前主题标识（THEME_DARK / THEME_LIGHT）：@State themeDark 只是它的镜像，两者一起改 */
+  private theme: string = THEME_DARK;
   /** 聊天记忆（SQLite）与「最近 N 轮」的内存副本，两者同步维护 */
   private mem: ChatMemory = new ChatMemory();
   private history: ChatTurn[] = [];
@@ -339,7 +373,9 @@ struct Index {
         }
       })
 
-      // 深空纵深：上下压暗、中间留透明，人物与粒子在中段透出来，文字区另有暗色遮罩
+      // 深空纵深：上下压暗、中间留透明，人物与粒子在中段透出来，文字区另有暗色遮罩。
+      // 这 6 个色标是 3D 背景的一部分（永远深色、不随主题变），所以留在原处不进口 Theme 表：
+      // 主题表管的是 UI 层的「面/字/线/按钮」，不含全息场景本身。
       Column()
         .width('100%')
         .height('100%')
@@ -350,20 +386,39 @@ struct Index {
         })
         .hitTestBehavior(HitTestMode.Transparent)
 
+      // 🎨 主题纱：3D 层（Avatar3D）永远是深色全息场景，不参与主题切换。
+      // 深色主题 veil3d 全透明（这层什么都不做）；浅色主题是 70% 浅纱，
+      // 把场景压成背景水印，UI 层再换成近白面 + 深色字，文字对比度不靠运气。
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.pal().veil3d)
+        .hitTestBehavior(HitTestMode.Transparent)
+
       Column() {
         Row() {
-          Text('Cyber-Twin')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#FFFFFF')
+          // 💬 当前会话就是多会话入口：点开是会话列表（新建 / 改名 / 删除 / 切换）
+          Text('≡ ' + this.curTitle)
+            .fontSize(12)
+            .fontColor(this.pal().text)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(TextAlign.Start)
+            .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+            .borderRadius(14)
+            .backgroundColor(this.pal().btnBg)
             .layoutWeight(1)
+            .margin({ right: 8 })
+            .onClick(() => {
+              this.openSessions();
+            })
 
           Button(this.loading ? '导入中…' : '📦 模型')
             .height(32)
             .fontSize(13)
             .borderRadius(16)
-            .backgroundColor('#3D3D4D')
-            .fontColor('#FFFFFF')
+            .backgroundColor(this.pal().btnBg)
+            .fontColor(this.pal().text)
             .onClick(() => {
               this.importModel();
             })
@@ -372,8 +427,8 @@ struct Index {
             .height(32)
             .fontSize(13)
             .borderRadius(16)
-            .backgroundColor('#3D3D4D')
-            .fontColor('#FFFFFF')
+            .backgroundColor(this.pal().btnBg)
+            .fontColor(this.pal().text)
             .margin({ left: 8 })
             .onClick(() => {
               this.keyInput = this.cloudKey;
@@ -385,8 +440,8 @@ struct Index {
             .height(32)
             .fontSize(13)
             .borderRadius(16)
-            .backgroundColor(this.accOn ? '#2E7D32' : '#3D3D4D')
-            .fontColor('#FFFFFF')
+            .backgroundColor(this.accOn ? this.pal().okBg : this.pal().btnBg)
+            .fontColor(this.pal().text)
             .margin({ left: 8 })
             .onClick(() => {
               this.openCtrl();
@@ -395,16 +450,16 @@ struct Index {
         .width('100%')
         .height(56)
         .padding({ left: 16, right: 16 })
-        .backgroundColor('#E62C2C35')
+        .backgroundColor(this.pal().bgHeader)
 
         Row() {
           Text(this.modeLabel)
             .fontSize(12)
-            .fontColor('#AAAAAA')
+            .fontColor(this.pal().textDim)
             .layoutWeight(1)
           Text(this.ttsOn ? '🔊' : '🔇')
             .fontSize(15)
-            .fontColor(this.ttsOn ? '#7BE495' : '#66666F')
+            .fontColor(this.ttsOn ? this.pal().ok : this.pal().textOff)
             .padding({ left: 10, right: 10 })
             .onClick(() => {
               this.toggleTts();
@@ -412,7 +467,7 @@ struct Index {
           if (this.speechHint !== '') {
             Text(this.speechHint)
               .fontSize(11)
-              .fontColor(this.listening ? '#FFD180' : '#7BE495')
+              .fontColor(this.listening ? this.pal().warn : this.pal().ok)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .constraintSize({ maxWidth: '40%' })
@@ -421,7 +476,7 @@ struct Index {
           if (this.v3dMsg !== '') {
             Text(this.v3dMsg)
               .fontSize(10)
-              .fontColor(this.v3dMsg.indexOf('失败') >= 0 ? '#FF8A65' : '#7BE495')
+              .fontColor(this.v3dMsg.indexOf('失败') >= 0 ? this.pal().errSoft : this.pal().ok)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .constraintSize({ maxWidth: '32%' })
@@ -429,14 +484,14 @@ struct Index {
           }
           Text(this.status)
             .fontSize(11)
-            .fontColor('#8A8A99')
+            .fontColor(this.pal().textMuted)
             .layoutWeight(2)
             .textAlign(TextAlign.End)
             .maxLines(2)
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 6, bottom: 6 })
-        .backgroundColor('#E6242430')
+        .backgroundColor(this.pal().bgStatus)
 
         List({ space: 10 }) {
           ForEach(this.lines, (line: ChatLine, index: number) => {
@@ -447,8 +502,8 @@ struct Index {
                   .padding(14)
                   .borderRadius(18)
                   .fontSize(16)
-                  .fontColor('#FFFFFF')
-                  .backgroundColor(line.role === 'user' ? '#6C63FF' : '#C0333333')
+                  .fontColor(line.role === 'user' ? this.pal().bubbleUserText : this.pal().bubbleBotText)
+                  .backgroundColor(line.role === 'user' ? this.pal().bubbleUser : this.pal().bubbleBot)
                   .constraintSize({ maxWidth: '78%' })
               }
               .width('100%')
@@ -461,7 +516,7 @@ struct Index {
         .layoutWeight(1)
         .width('100%')
         .padding(16)
-        .backgroundColor('#99141820')
+        .backgroundColor(this.pal().bgList)
 
         Row({ space: 8 }) {
           Button(this.listening ? '🎙' : '🎤')
@@ -469,8 +524,8 @@ struct Index {
             .height(44)
             .fontSize(17)
             .borderRadius(22)
-            .backgroundColor(this.listening ? '#C62828' : '#3D3D4D')
-            .fontColor('#FFFFFF')
+            .backgroundColor(this.listening ? this.pal().danger : this.pal().btnBg)
+            .fontColor(this.pal().text)
             .onTouch((event: TouchEvent) => {
               if (event.type === TouchType.Down) {
                 this.startListening();
@@ -484,8 +539,8 @@ struct Index {
             .height(44)
             .fontSize(17)
             .borderRadius(22)
-            .backgroundColor('#3D3D4D')
-            .fontColor('#FFFFFF')
+            .backgroundColor(this.pal().btnBg)
+            .fontColor(this.pal().text)
             .onClick(() => {
               this.fillFromClipboard();
             })
@@ -494,9 +549,9 @@ struct Index {
             .layoutWeight(1)
             .height(44)
             .borderRadius(22)
-            .backgroundColor('#33333F')
-            .fontColor('#FFFFFF')
-            .placeholderColor('#8A8A99')
+            .backgroundColor(this.pal().bgInput)
+            .fontColor(this.pal().text)
+            .placeholderColor(this.pal().placeholder)
             .onChange((value: string) => {
               this.input = value;
               this.touchInteraction('input');
@@ -509,7 +564,7 @@ struct Index {
           Button(this.generating ? '停止' : '发送')
             .height(40)
             .borderRadius(20)
-            .backgroundColor(this.generating ? '#C62828' : '#6C63FF')
+            .backgroundColor(this.generating ? this.pal().danger : this.pal().primary)
             .onClick(() => {
               if (this.generating) {
                 this.stopGenerating();
@@ -520,7 +575,7 @@ struct Index {
         }
         .width('100%')
         .padding(10)
-        .backgroundColor('#F22C2C35')
+        .backgroundColor(this.pal().bgInputBar)
       }
       .width('100%')
       .height('100%')
@@ -531,7 +586,7 @@ struct Index {
           Column()
             .width('100%')
             .height('100%')
-            .backgroundColor('#99000000')
+            .backgroundColor(this.pal().scrim)
             .onClick(() => {
               this.showCloud = false;
             })
@@ -546,7 +601,7 @@ struct Index {
           Column()
             .width('100%')
             .height('100%')
-            .backgroundColor('#99000000')
+            .backgroundColor(this.pal().scrim)
             .onClick(() => {
               this.showCtrl = false;
             })
@@ -555,10 +610,25 @@ struct Index {
         .width('100%')
         .height('100%')
       }
+
+      if (this.showSessions) {
+        Stack({ alignContent: Alignment.Center }) {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor(this.pal().scrim)
+            .onClick(() => {
+              this.showSessions = false;
+            })
+          this.SessionsPanel()
+        }
+        .width('100%')
+        .height('100%')
+      }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#1E1E24')
+    .backgroundColor(this.pal().bgRoot)
   }
 
   @Builder
@@ -567,28 +637,28 @@ struct Index {
       Text('☁️ 云端 Key 配置')
         .fontSize(16)
         .fontWeight(FontWeight.Bold)
-        .fontColor('#FFFFFF')
+        .fontColor(this.pal().text)
         .width('100%')
       Text('Key 只保存在应用沙箱（preferences），不上传、不写日志。')
         .fontSize(11)
-        .fontColor('#8A8A99')
+        .fontColor(this.pal().textMuted)
         .width('100%')
       TextInput({ text: this.keyInput, placeholder: 'API Key（sk-…）' })
         .type(InputType.Password)
         .height(44)
         .borderRadius(10)
-        .backgroundColor('#33333F')
-        .fontColor('#FFFFFF')
-        .placeholderColor('#8A8A99')
+        .backgroundColor(this.pal().bgInput)
+        .fontColor(this.pal().text)
+        .placeholderColor(this.pal().placeholder)
         .onChange((value: string) => {
           this.keyInput = value;
         })
       TextInput({ text: this.modelInput, placeholder: DEFAULT_MODEL })
         .height(44)
         .borderRadius(10)
-        .backgroundColor('#33333F')
-        .fontColor('#FFFFFF')
-        .placeholderColor('#8A8A99')
+        .backgroundColor(this.pal().bgInput)
+        .fontColor(this.pal().text)
+        .placeholderColor(this.pal().placeholder)
         .onChange((value: string) => {
           this.modelInput = value;
         })
@@ -597,7 +667,7 @@ struct Index {
           .layoutWeight(1)
           .height(40)
           .borderRadius(20)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             this.saveCloudKey();
           })
@@ -605,7 +675,7 @@ struct Index {
           .layoutWeight(1)
           .height(40)
           .borderRadius(20)
-          .backgroundColor('#C62828')
+          .backgroundColor(this.pal().danger)
           .onClick(() => {
             this.clearCloudKey();
           })
@@ -613,7 +683,7 @@ struct Index {
           .layoutWeight(1)
           .height(40)
           .borderRadius(20)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.showCloud = false;
           })
@@ -623,7 +693,152 @@ struct Index {
     .width('86%')
     .padding(20)
     .borderRadius(16)
-    .backgroundColor('#2C2C35')
+    .backgroundColor(this.pal().bgPanel)
+  }
+
+  @Builder
+  SessionsPanel() {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        Text('💬 会话')
+          .fontSize(16)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.pal().text)
+          .layoutWeight(1)
+        Button('＋ 新建')
+          .height(30)
+          .fontSize(12)
+          .borderRadius(15)
+          .backgroundColor(this.pal().primary)
+          .onClick(() => {
+            this.newSession();
+          })
+        Button('关闭')
+          .height(30)
+          .fontSize(12)
+          .borderRadius(15)
+          .backgroundColor(this.pal().btnBg)
+          .onClick(() => {
+            this.showSessions = false;
+          })
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text('当前：' + this.curTitle + ' · 共 ' + this.sessions.length + ' 个')
+          .fontSize(11)
+          .fontColor(this.pal().textDim)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        Button(this.globalSearch ? '🔍 全库检索：开' : '🔍 全库检索：关')
+          .height(28)
+          .fontSize(11)
+          .borderRadius(14)
+          .backgroundColor(this.globalSearch ? this.pal().primary : this.pal().btnBg)
+          .fontColor(this.globalSearch ? this.pal().bubbleUserText : this.pal().text)
+          .onClick(() => {
+            this.toggleGlobalSearch();
+          })
+      }
+      .width('100%')
+
+      Scroll() {
+        Column({ space: 6 }) {
+          ForEach(this.sessions, (s: SessionRow) => {
+            Column() {
+              Row({ space: 6 }) {
+                if (this.renamingId === s.id) {
+                  TextInput({ text: this.renameText, placeholder: '会话名' })
+                    .layoutWeight(1)
+                    .height(32)
+                    .fontSize(12)
+                    .borderRadius(8)
+                    .backgroundColor(this.pal().bgInput)
+                    .fontColor(this.pal().text)
+                    .placeholderColor(this.pal().placeholder)
+                    .onChange((v: string) => {
+                      this.renameText = v;
+                    })
+                  Button('确定')
+                    .height(32)
+                    .fontSize(12)
+                    .borderRadius(16)
+                    .backgroundColor(this.pal().primary)
+                    .onClick(() => {
+                      this.commitRename();
+                    })
+                  Button('取消')
+                    .height(32)
+                    .fontSize(12)
+                    .borderRadius(16)
+                    .backgroundColor(this.pal().btnBg)
+                    .fontColor(this.pal().text)
+                    .onClick(() => {
+                      this.renamingId = 0;
+                    })
+                } else {
+                  Column({ space: 2 }) {
+                    Text(s.title)
+                      .fontSize(14)
+                      .fontWeight(s.id === this.curSessionId ? FontWeight.Bold : FontWeight.Normal)
+                      .fontColor(s.id === this.curSessionId ? this.pal().primary : this.pal().text)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+                    Text(formatShort(s.updatedTs) + ' · ' + s.count + ' 条消息')
+                      .fontSize(10)
+                      .fontColor(this.pal().textMuted)
+                      .width('100%')
+                  }
+                  .alignItems(HorizontalAlign.Start)
+                  .layoutWeight(1)
+                  .onClick(() => {
+                    this.switchSession(s.id);
+                  })
+                  Text('✏️')
+                    .fontSize(15)
+                    .padding(6)
+                    .onClick(() => {
+                      this.startRename(s);
+                    })
+                  Text('🗑')
+                    .fontSize(15)
+                    .padding(6)
+                    .onClick(() => {
+                      this.confirmDeleteSession(s);
+                    })
+                }
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(10)
+            .borderRadius(10)
+            .backgroundColor(this.pal().bgInput)
+            .border({
+              width: 1,
+              color: s.id === this.curSessionId ? this.pal().primary : this.pal().border
+            })
+          }, (s: SessionRow) => s.id + '|' + s.title + '|' + s.updatedTs + '|' + s.count
+            + '|' + (this.renamingId === s.id ? 'rename' : 'idle'))
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .scrollBar(BarState.Auto)
+
+      Text('点会话名即切过去；删除会连同该会话的消息一起删，且至少保留一个会话。')
+        .fontSize(10)
+        .fontColor(this.pal().textMuted)
+        .width('100%')
+    }
+    .width('88%')
+    .height('70%')
+    .padding(16)
+    .borderRadius(16)
+    .backgroundColor(this.pal().bgPanel)
   }
 
   @Builder
@@ -633,29 +848,86 @@ struct Index {
         Text('🤖 操控（调试 / 授权）')
           .fontSize(16)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
+          .fontColor(this.pal().text)
           .layoutWeight(1)
         Button('关闭')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.showCtrl = false;
           })
       }
       .width('100%')
 
+      // 🎨 主题切换：只切 UI 层，3D 层永远深色（浅色主题下由 veil3d 浅纱压暗）
+      Row({ space: 8 }) {
+        Text('🎨 主题：' + themeLabel(this.theme))
+          .fontSize(13)
+          .fontColor(this.pal().textDim)
+          .layoutWeight(1)
+        Button('深色')
+          .height(30)
+          .fontSize(12)
+          .borderRadius(15)
+          .backgroundColor(this.themeDark ? this.pal().primary : this.pal().btnBg)
+          .fontColor(this.themeDark ? this.pal().bubbleUserText : this.pal().text)
+          .onClick(() => {
+            this.saveTheme(THEME_DARK);
+          })
+        Button('浅色')
+          .height(30)
+          .fontSize(12)
+          .borderRadius(15)
+          .backgroundColor(this.themeDark ? this.pal().btnBg : this.pal().primary)
+          .fontColor(this.themeDark ? this.pal().text : this.pal().bubbleUserText)
+          .onClick(() => {
+            this.saveTheme(THEME_LIGHT);
+          })
+      }
+      .width('100%')
+
+      // 📤 导出：当前会话 → Markdown / 整库 → .db 备份，都落到沙箱 filesDir/export 再走系统分享
+      Row({ space: 8 }) {
+        Button('导出 Markdown')
+          .layoutWeight(1)
+          .height(34)
+          .fontSize(12)
+          .borderRadius(17)
+          .backgroundColor(this.pal().primary)
+          .onClick(() => {
+            this.exportMarkdown();
+          })
+        Button('备份数据库')
+          .layoutWeight(1)
+          .height(34)
+          .fontSize(12)
+          .borderRadius(17)
+          .backgroundColor(this.pal().btnBg)
+          .fontColor(this.pal().text)
+          .onClick(() => {
+            this.backupDatabase();
+          })
+      }
+      .width('100%')
+
+      Text('📤 ' + this.expNote)
+        .fontSize(10)
+        .fontColor(this.expNote.indexOf('❌') >= 0 ? this.pal().err : this.pal().textMuted)
+        .width('100%')
+        .maxLines(3)
+
       Row({ space: 8 }) {
         Text('🧍 形象：' + profileOf(this.avatarKind).label + '（' + profileOf(this.avatarKind).file + '）')
           .fontSize(13)
-          .fontColor('#7BE495')
+          .fontColor(this.pal().ok)
           .layoutWeight(1)
         Button('切换形象')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             const next: number = this.avatarKind === KIND_ANIME ? KIND_REALISTIC : KIND_ANIME;
             this.avatarKind = next;
@@ -668,13 +940,13 @@ struct Index {
       Row({ space: 8 }) {
         Text(this.accOn ? '无障碍：✅ 已开启' : '无障碍：❌ 未开启')
           .fontSize(13)
-          .fontColor(this.accOn ? '#7BE495' : '#FF8A80')
+          .fontColor(this.accOn ? this.pal().ok : this.pal().err)
           .layoutWeight(1)
         Button('刷新状态')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.refreshAccState();
           })
@@ -682,7 +954,7 @@ struct Index {
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             this.gotoAccessibilitySettings();
           })
@@ -692,25 +964,25 @@ struct Index {
       if (!this.accOn) {
         Text('系统要求本人手动打开，App 无法代开：设置 → 辅助功能 → 无障碍 → 苏兴无障碍 → 打开开关。')
           .fontSize(11)
-          .fontColor('#FFD180')
+          .fontColor(this.pal().warn)
           .width('100%')
       }
 
       Text('前台包名：' + (this.ctrlBundle === '' ? '（还没读屏）' : this.ctrlBundle))
         .fontSize(12)
-        .fontColor('#AAAAAA')
+        .fontColor(this.pal().textDim)
         .width('100%')
 
       Row({ space: 8 }) {
         Text('🧠 记忆：' + this.memCount + ' 条')
           .fontSize(13)
-          .fontColor('#7BE495')
+          .fontColor(this.pal().ok)
           .layoutWeight(1)
         Button('清空聊天记录')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#C62828')
+          .backgroundColor(this.pal().danger)
           .onClick(() => {
             this.confirmClearMemory();
           })
@@ -720,26 +992,26 @@ struct Index {
       Text('🔍 历史检索：命中 ' + this.ragHitCount + ' 条 / 候选 ' + this.ragPool + ' 条'
         + (this.ragQuery === '' ? '' : '（最近查询：' + this.ragQuery + '）'))
         .fontSize(12)
-        .fontColor(this.ragHitCount > 0 ? '#7BA7FF' : '#8A8A99')
+        .fontColor(this.ragHitCount > 0 ? this.pal().info : this.pal().textMuted)
         .width('100%')
         .maxLines(2)
 
       Text('💭 主动搭话：' + (this.proInfo === '' ? '待命' : this.proInfo))
         .fontSize(12)
-        .fontColor('#C8A6FF')
+        .fontColor(this.pal().accent2)
         .width('100%')
         .maxLines(2)
 
       Row({ space: 8 }) {
         Text('🎭 人格：先生 · 偏好 ' + this.traitCount + ' 条')
           .fontSize(13)
-          .fontColor('#FFD180')
+          .fontColor(this.pal().warn)
           .layoutWeight(1)
         Button('清空偏好')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.clearTraits();
           })
@@ -748,12 +1020,12 @@ struct Index {
 
       Text(this.emoFace + ' 情绪：' + this.emoTip + '（valence ' + this.emoValence.toFixed(2) + '）')
         .fontSize(12)
-        .fontColor('#AAAAAA')
+        .fontColor(this.pal().textDim)
         .width('100%')
 
       Text('记忆落库：' + (this.mem.dbPath() === '' ? '（未知）' : this.mem.dbPath()))
         .fontSize(10)
-        .fontColor('#8A8A99')
+        .fontColor(this.pal().textMuted)
         .width('100%')
         .maxLines(2)
 
@@ -762,7 +1034,7 @@ struct Index {
           ForEach(this.ctrlTexts, (t: string, i: number) => {
             Text((i + 1) + '. ' + t)
               .fontSize(11)
-              .fontColor('#DDDDDD')
+              .fontColor(this.pal().text)
               .width('100%')
           }, (t: string, i: number) => i.toString() + '|' + t)
         }
@@ -777,7 +1049,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.sendCmd('dump', '', '');
           })
@@ -786,7 +1058,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.sendCmd('back', '', '');
           })
@@ -795,7 +1067,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.sendCmd('swipe', '', '');
           })
@@ -804,7 +1076,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.sendCmd('home', '', '');
           })
@@ -817,8 +1089,8 @@ struct Index {
           .height(36)
           .fontSize(12)
           .borderRadius(10)
-          .backgroundColor('#33333F')
-          .fontColor('#FFFFFF')
+          .backgroundColor(this.pal().bgInput)
+          .fontColor(this.pal().text)
           .onChange((value: string) => {
             this.ctlTapText = value;
           })
@@ -826,7 +1098,7 @@ struct Index {
           .height(36)
           .fontSize(12)
           .borderRadius(18)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             this.sendCmd('tap', this.ctlTapText, '');
           })
@@ -839,8 +1111,8 @@ struct Index {
           .height(36)
           .fontSize(12)
           .borderRadius(10)
-          .backgroundColor('#33333F')
-          .fontColor('#FFFFFF')
+          .backgroundColor(this.pal().bgInput)
+          .fontColor(this.pal().text)
           .onChange((value: string) => {
             this.ctlTypeText = value;
           })
@@ -848,7 +1120,7 @@ struct Index {
           .height(36)
           .fontSize(12)
           .borderRadius(18)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             this.sendCmd('type', this.ctlTypeText, '');
           })
@@ -859,26 +1131,26 @@ struct Index {
         + '本机无法后台静默发微信。改为两条降级路径：① 系统分享面板（内容已填好，点微信 → 选联系人 → 发送）；'
         + '② 系统分享不可用时，自动复制到剪贴板并拉起微信，长按粘贴即可。')
         .fontSize(11)
-        .fontColor('#FFD180')
+        .fontColor(this.pal().warn)
         .width('100%')
 
       Text('主用法：在对话框里直接说「给微信文件传输助手发消息：明天见」，分身会自己解析收件人和内容并执行。')
         .fontSize(11)
-        .fontColor('#7BE495')
+        .fontColor(this.pal().ok)
         .width('100%')
 
       Row({ space: 8 }) {
         Text('🔊 朗读：' + (this.ttsOn ? '开' : '关') + ' · '
           + (this.voiceText === '' ? '音色未查询（朗读一次后出现）' : this.voiceText))
           .fontSize(11)
-          .fontColor('#AAAAAA')
+          .fontColor(this.pal().textDim)
           .layoutWeight(1)
           .maxLines(3)
         Button('切音色')
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.cycleVoice();
           })
@@ -886,7 +1158,7 @@ struct Index {
           .height(30)
           .fontSize(12)
           .borderRadius(15)
-          .backgroundColor('#2E7D32')
+          .backgroundColor(this.pal().okBg)
           .onClick(() => {
             // 面板内直测：不依赖云模型，用来验证 TTS 振幅是否真的驱动 viseme
             this.speakReply('苏兴在这儿，这是形象口型测试，一、二、三、四。');
@@ -900,7 +1172,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#6C63FF')
+          .backgroundColor(this.pal().primary)
           .onClick(() => {
             this.testShare(false);
           })
@@ -909,7 +1181,7 @@ struct Index {
           .height(34)
           .fontSize(12)
           .borderRadius(17)
-          .backgroundColor('#3D3D4D')
+          .backgroundColor(this.pal().btnBg)
           .onClick(() => {
             this.testShare(true);
           })
@@ -921,7 +1193,7 @@ struct Index {
         .height(34)
         .fontSize(12)
         .borderRadius(17)
-        .backgroundColor('#2E7D32')
+        .backgroundColor(this.pal().okBg)
         .onClick(() => {
           this.testClipboardLaunch();
         })
@@ -929,7 +1201,7 @@ struct Index {
       Scroll() {
         Text(this.ctrlLog === '' ? '（暂无日志）' : this.ctrlLog)
           .fontSize(10)
-          .fontColor('#9AD0FF')
+          .fontColor(this.pal().logText)
           .width('100%')
           .textAlign(TextAlign.Start)
       }
@@ -940,7 +1212,40 @@ struct Index {
     .height('90%')
     .padding(16)
     .borderRadius(16)
-    .backgroundColor('#2C2C35')
+    .backgroundColor(this.pal().bgPanel)
+  }
+
+  // ------------------------------------------------------------ 🎨 主题
+
+  /** 当前主题的颜色表：build / 各 @Builder 的颜色一律走这里，页面里不留十六进制字面量 */
+  private pal(): Palette {
+    return paletteOf(this.theme);
+  }
+
+  /**
+   * 切换主题并落 preferences。
+   * 3D 层（Avatar3D）不跟着切：它永远是深色全息场景，浅色主题下由 build() 里那层
+   * veil3d 浅纱把它压成背景水印，只切 UI 层的颜色。
+   */
+  private async saveTheme(theme: string): Promise<void> {
+    this.theme = theme === THEME_LIGHT ? THEME_LIGHT : THEME_DARK;
+    this.themeDark = this.theme === THEME_DARK;
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'theme set %{public}s', this.theme);
+    try {
+      let pref: preferences.Preferences;
+      if (this.pref === undefined) {
+        pref = await preferences.getPreferences(getContext(this) as common.UIAbilityContext, PREF_NAME);
+        this.pref = pref;
+      } else {
+        pref = this.pref;
+      }
+      pref.putSync(KEY_THEME, this.theme);
+      await pref.flush();
+      promptAction.showToast({ message: '🎨 主题已切到' + themeLabel(this.theme), duration: 1500 });
+    } catch (e) {
+      this.status = '主题保存失败：' + (e as Error).message;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'theme save failed: %{public}s', (e as Error).message);
+    }
   }
 
   // ------------------------------------------------------------ 🤖 操控面板逻辑
@@ -979,6 +1284,21 @@ struct Index {
         this.traitCount = await this.persona.traitCount();
       }
     }
+    // 多会话：init 里已经做完迁移（补 session_id 列 → 建默认会话 → 老消息归进去），这里接上当前会话
+    this.mem.setGlobalSearch(this.globalSearch);
+    this.curSessionId = this.mem.currentSessionId();
+    await this.refreshSessions();
+    hilog.info(LOG_DOMAIN, LOG_TAG,
+      'memory sessions=%{public}d current=%{public}d migrated=%{public}d title=[%{public}s]',
+      this.sessions.length, this.curSessionId, this.mem.migratedRows(), this.curTitle);
+    await this.loadSessionIntoUi('boot');
+  }
+
+  /**
+   * 把「当前会话」的消息灌进界面与上下文。
+   * 启动、切会话、删掉当前会话之后都走这里，保证 lines / history / 检索窗口三者是同一批数据。
+   */
+  private async loadSessionIntoUi(tag: string): Promise<void> {
     const rows: MemRow[] = await this.mem.loadRecent(LOAD_LIMIT);
     // 旧消息渲染前同样过 stripThink：库里仍存原文（不改存储），但显示与上下文都只用干净文本。
     // 整条都是思考的 assistant 行直接丢弃（不显示「思考已省略」占位，历史里那种气泡没有信息量）。
@@ -998,9 +1318,13 @@ struct Index {
       const line: ChatLine = { role: r.role === 'user' ? 'user' : 'assistant', text: r.text };
       loaded.push(line);
     }
-    if (loaded.length > 0) {
-      this.lines = loaded;
-    }
+    // 切会话必须无条件覆盖：新会话可能是空的，留着上一个会话的气泡就是串台
+    this.lines = loaded;
+    this.pendingIndex = -1;
+    this.pendingUserText = '';
+    this.ragLines = [];
+    this.ragHitCount = 0;
+    this.ragPool = 0;
     const cap: number = HISTORY_ROUNDS * 2;
     const recent: MemRow[] =
       cleanRows.length > cap ? cleanRows.slice(cleanRows.length - cap) : cleanRows;
@@ -1011,9 +1335,10 @@ struct Index {
     }
     this.memCount = await this.mem.count();
     hilog.info(LOG_DOMAIN, LOG_TAG,
-      'memory loaded rows=%{public}d count=%{public}d hist=%{public}d stripDropped=%{public}d path=%{public}s',
-      loaded.length, this.memCount, this.history.length, dropped, this.mem.dbPath());
-    hilog.info(LOG_DOMAIN, LOG_TAG, 'memory hist text=[%{public}s]', describeTurns(this.history, 400));
+      'session load tag=%{public}s id=%{public}d loaded=%{public}d count=%{public}d hist=%{public}d stripDropped=%{public}d path=%{public}s',
+      tag, this.curSessionId, loaded.length, this.memCount, this.history.length, dropped,
+      this.mem.dbPath());
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session hist text=[%{public}s]', describeTurns(this.history, 400));
   }
 
   /**
@@ -1134,7 +1459,7 @@ struct Index {
       },
       secondaryButton: {
         value: '确定清空',
-        fontColor: '#C62828',
+        fontColor: this.pal().danger,
         action: () => {
           this.clearMemory();
         }
@@ -1155,6 +1480,262 @@ struct Index {
     hilog.info(LOG_DOMAIN, LOG_TAG, 'memory clear ok=%{public}s count=%{public}d path=%{public}s',
       '' + ok, this.memCount, this.mem.dbPath());
     promptAction.showToast({ message: ok ? '🧠 已清空聊天记录' : '清空失败', duration: 2000 });
+  }
+
+  // ------------------------------------------------------------ 💬 多会话
+
+  /** 从库里重读会话列表，并把当前会话标题同步到顶栏 */
+  private async refreshSessions(): Promise<void> {
+    this.sessions = await this.mem.listSessions();
+    let title: string = '';
+    for (const s of this.sessions) {
+      if (s.id === this.curSessionId) {
+        title = s.title;
+      }
+    }
+    if (title === '') {
+      title = this.sessions.length > 0 ? this.sessions[0].title : DEFAULT_SESSION_TITLE;
+    }
+    this.curTitle = title;
+  }
+
+  private openSessions(): void {
+    if (this.generating) {
+      promptAction.showToast({ message: '正在生成，先停止再切会话', duration: 2000 });
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'session panel refused reason=generating');
+      return;
+    }
+    this.refreshSessions().catch((e: Error) => {
+      this.status = '读取会话列表失败：' + e.message;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'session refresh failed: %{public}s', e.message);
+    });
+    this.showSessions = true;
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session panel open current=%{public}d total=%{public}d',
+      this.curSessionId, this.sessions.length);
+  }
+
+  /** 切会话：消息列表、上下文、检索窗口一起切到该会话 */
+  private async switchSession(id: number): Promise<void> {
+    if (this.generating) {
+      promptAction.showToast({ message: '正在生成，先停止再切会话', duration: 2000 });
+      return;
+    }
+    if (id === this.curSessionId) {
+      this.showSessions = false;
+      return;
+    }
+    const ok: boolean = await this.mem.setCurrentSession(id);
+    if (!ok) {
+      this.status = '❌ 切换会话失败：数据库没就绪（见 hilog）';
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'session switch failed id=%{public}d', id);
+      return;
+    }
+    this.curSessionId = id;
+    await this.refreshSessions();
+    await this.loadSessionIntoUi('switch');
+    this.showSessions = false;
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session switched id=%{public}d title=[%{public}s] lines=%{public}d',
+      id, this.curTitle, this.lines.length);
+    promptAction.showToast({ message: '已切到「' + this.curTitle + '」', duration: 1500 });
+  }
+
+  private async newSession(): Promise<void> {
+    if (this.generating) {
+      promptAction.showToast({ message: '正在生成，先停止再新建会话', duration: 2000 });
+      return;
+    }
+    const id: number = await this.mem.createSession('');
+    if (id <= 0) {
+      this.status = '❌ 新建会话失败：见 hilog';
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'session create failed');
+      promptAction.showToast({ message: '新建会话失败', duration: 2000 });
+      return;
+    }
+    await this.mem.setCurrentSession(id);
+    this.curSessionId = id;
+    await this.refreshSessions();
+    await this.loadSessionIntoUi('new');
+    this.showSessions = false;
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session created id=%{public}d total=%{public}d',
+      id, this.sessions.length);
+    promptAction.showToast({ message: '💬 已新建会话', duration: 1500 });
+  }
+
+  private startRename(s: SessionRow): void {
+    this.renamingId = s.id;
+    this.renameText = s.title;
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session rename start id=%{public}d title=[%{public}s]', s.id, s.title);
+  }
+
+  private async commitRename(): Promise<void> {
+    const id: number = this.renamingId;
+    const t: string = this.renameText.trim();
+    this.renamingId = 0;
+    if (id <= 0) {
+      return;
+    }
+    if (t === '') {
+      promptAction.showToast({ message: '会话名不能为空', duration: 1500 });
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'session rename refused reason=empty id=%{public}d', id);
+      return;
+    }
+    const ok: boolean = await this.mem.renameSession(id, t);
+    await this.refreshSessions();
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session rename id=%{public}d ok=%{public}s title=[%{public}s]',
+      id, '' + ok, t);
+    promptAction.showToast({ message: ok ? '已改名为「' + t + '」' : '改名失败', duration: 1500 });
+  }
+
+  /** 删除要二次确认，且至少保留一个会话 */
+  private confirmDeleteSession(s: SessionRow): void {
+    if (this.sessions.length <= 1) {
+      promptAction.showToast({ message: '至少保留一个会话', duration: 2000 });
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'session delete refused reason=keep-one total=%{public}d',
+        this.sessions.length);
+      return;
+    }
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session delete confirm id=%{public}d title=[%{public}s] count=%{public}d',
+      s.id, s.title, s.count);
+    AlertDialog.show({
+      title: '删除会话',
+      message: '「' + s.title + '」及其 ' + s.count + ' 条消息将被删除，无法恢复。确定删除？',
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          hilog.info(LOG_DOMAIN, LOG_TAG, 'session delete cancelled id=%{public}d', s.id);
+        }
+      },
+      secondaryButton: {
+        value: '确定删除',
+        fontColor: this.pal().danger,
+        action: () => {
+          this.deleteSession(s.id, s.title);
+        }
+      }
+    });
+  }
+
+  private async deleteSession(id: number, title: string): Promise<void> {
+    const wasCur: boolean = id === this.curSessionId;
+    const ok: boolean = await this.mem.deleteSession(id);
+    this.curSessionId = this.mem.currentSessionId();
+    await this.refreshSessions();
+    if (wasCur) {
+      await this.loadSessionIntoUi('delete');
+    }
+    hilog.info(LOG_DOMAIN, LOG_TAG,
+      'session deleted id=%{public}d ok=%{public}s wasCurrent=%{public}s current=%{public}d total=%{public}d',
+      id, '' + ok, '' + wasCur, this.curSessionId, this.sessions.length);
+    promptAction.showToast({
+      message: ok ? ('已删除「' + title + '」') : '删除失败（至少保留一个会话）',
+      duration: 2000
+    });
+  }
+
+  /** 全库检索：默认关。开着时 RAG 会跨会话捞候选行 */
+  private toggleGlobalSearch(): void {
+    this.globalSearch = !this.globalSearch;
+    this.mem.setGlobalSearch(this.globalSearch);
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'session globalSearch=%{public}s', '' + this.globalSearch);
+    promptAction.showToast({
+      message: this.globalSearch ? '🔍 全库检索：开（会跨话题）' : '🔍 全库检索：关（只看当前会话）',
+      duration: 2000
+    });
+  }
+
+  // ------------------------------------------------------------ 📤 聊天导出 / 数据库备份
+
+  /** 导出目录（沙箱内，系统分享可读）：filesDir/export */
+  private ensureExportDir(ctx: common.UIAbilityContext): string {
+    const dir: string = ctx.filesDir + '/' + EXPORT_DIR;
+    if (!fs.accessSync(dir)) {
+      fs.mkdirSync(dir);
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'export dir created path=%{public}s', dir);
+    }
+    return dir;
+  }
+
+  /** 文件名用时间戳：20261117_213605 */
+  private fileStamp(ts: number): string {
+    const d: Date = new Date(ts);
+    const p = (n: number): string => (n < 10 ? '0' + n : '' + n);
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_'
+      + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  /** 当前会话 → Markdown 落盘 → 走系统分享。失败原因写进面板/状态条/hilog，不静默 */
+  private async exportMarkdown(): Promise<void> {
+    this.expNote = '导出中…（' + this.curTitle + '）';
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const rows: MemRow[] = await this.mem.loadAll(EXPORT_MAX_ROWS);
+      if (rows.length === 0) {
+        this.expNote = '❌ 导出失败：当前会话还没有消息';
+        this.status = '❌ 导出失败：当前会话没有消息';
+        hilog.warn(LOG_DOMAIN, LOG_TAG, 'export md skip reason=no-rows session=%{public}d',
+          this.curSessionId);
+        promptAction.showToast({ message: '当前会话没有消息', duration: 2000 });
+        return;
+      }
+      const now: number = Date.now();
+      const md: string = buildSessionMarkdown(this.curTitle, rows, now);
+      const dir: string = this.ensureExportDir(ctx);
+      const name: string = '苏兴会话_' + safeFileStem(this.curTitle) + '_' + this.fileStamp(now) + '.md';
+      const path: string = dir + '/' + name;
+      const f: fs.File = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(f.fd, md);
+      } finally {
+        fs.closeSync(f);
+      }
+      const size: number = fs.statSync(path).size;
+      const head: string = md.split('\n').slice(0, 4).join(' ⏎ ');
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'export md ok path=%{public}s session=%{public}d rows=%{public}d chars=%{public}d bytes=%{public}d',
+        path, this.curSessionId, rows.length, md.length, size);
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'export md body=[%{public}s]', md.split('\n').join('⏎'));
+      this.expNote = '✅ ' + name + '（' + size + ' B / ' + rows.length + ' 条）';
+      this.ctrlLog = '导出 Markdown 成功：' + path;
+      this.status = '✅ 已导出 Markdown（' + rows.length + ' 条）';
+      await shareFileAt(ctx, path, '苏兴会话 · ' + this.curTitle + '.md', 'general.text');
+      this.expNote = this.expNote + ' · 已弹出分享面板';
+    } catch (e) {
+      const msg: string = (e as Error).message;
+      this.expNote = '❌ 导出 Markdown 失败：' + msg;
+      this.ctrlLog = '导出 Markdown 失败：' + msg;
+      this.status = '❌ 导出 Markdown 失败：' + msg;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'export md failed: %{public}s', msg);
+      promptAction.showToast({ message: '导出失败：' + msg, duration: 3000 });
+    }
+  }
+
+  /** 整库备份：RDB backup() 出一致性快照 → 复制到 filesDir/export → 系统分享 */
+  private async backupDatabase(): Promise<void> {
+    this.expNote = '备份中…';
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const dir: string = this.ensureExportDir(ctx);
+      const now: number = Date.now();
+      const name: string = 'cybertwin_memory_' + this.fileStamp(now) + '.db';
+      const path: string = dir + '/' + name;
+      await this.mem.backupDatabase(path);
+      const size: number = fs.statSync(path).size;
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'export db ok path=%{public}s bytes=%{public}d rows=%{public}d',
+        path, size, this.memCount);
+      this.expNote = '✅ ' + name + '（' + this.humanSize(size) + '）';
+      this.ctrlLog = '数据库备份成功：' + path;
+      this.status = '✅ 数据库已备份（' + this.humanSize(size) + '）';
+      await shareFileAt(ctx, path, '苏兴聊天记录备份.db', 'general.database');
+      this.expNote = this.expNote + ' · 已弹出分享面板';
+    } catch (e) {
+      const msg: string = (e as Error).message;
+      this.expNote = '❌ 数据库备份失败：' + msg;
+      this.ctrlLog = '数据库备份失败：' + msg;
+      this.status = '❌ 数据库备份失败：' + msg;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'export db failed: %{public}s', msg);
+      promptAction.showToast({ message: '备份失败：' + msg, duration: 3000 });
+    }
   }
 
   // ------------------------------------------------------------ 📋 剪贴板（用户明确要求时才读）
@@ -1616,6 +2197,10 @@ struct Index {
       this.cloudModel = (typeof m === 'string' && m !== '') ? m : DEFAULT_MODEL;
       const mp: preferences.ValueType = pref.getSync(KEY_MODEL_PATH, '');
       this.modelPath = typeof mp === 'string' ? mp : '';
+      const th: preferences.ValueType = pref.getSync(KEY_THEME, THEME_DARK);
+      this.theme = (typeof th === 'string' && th === THEME_LIGHT) ? THEME_LIGHT : THEME_DARK;
+      this.themeDark = this.theme === THEME_DARK;
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'theme loaded %{public}s', this.theme);
       this.keyInput = this.cloudKey;
       this.modelInput = this.cloudModel;
     } catch (e) {
