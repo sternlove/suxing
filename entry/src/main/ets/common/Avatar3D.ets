@@ -67,16 +67,23 @@ const FIXED_DT: number = 1 / 60;
 const MAX_STEPS: number = 5;
 
 /**
- * 帧节拍：先按 60fps 跑，实测掉到 PERF_MIN_FPS 以下自动退回 30fps（同一进程内只降不升）。
- * 门槛 46 → 38：46 太敏感，连续对话时一次推理卡顿就会永久锁在 30fps 直到重启。
- *
- * 已知设计缺陷：「只降不升」意味着一次抖动会永久牺牲后续流畅度。彻底修法是加带冷却的
- * 回升（连续 N 秒 fps>55 才尝试回 60），但会在临界点反复横跳，需要更谨慎的实测。
+ * 帧节拍：先按 60fps 跑，实测掉到 PERF_MIN_FPS 以下退回 30fps，冷却到期后试探性回升（见下方 PERF_COOLDOWN_MS）。
+ * 门槛 46 → 38：46 太敏感，连续对话时一次推理卡顿就会锁在 30fps。
  */
 const TICK_FAST: number = 16;
 const TICK_SLOW: number = 33;
 const PERF_WINDOW: number = 90;
 const PERF_MIN_FPS: number = 38;
+/**
+ * 试探式回升参数。
+ *
+ * 30fps 档下实测 fps 最高就是 30，所以不能用「fps 高于某值就回升」来判断——那永远不会成立。
+ * 改为周期性试探：进入慢档 PERF_COOLDOWN_MS 后升回 60fps 观察一个窗口，
+ * 撑得住就留下，撑不住立刻退回并把冷却翻倍（最长 3 分钟），避免反复横跳。
+ */
+const PERF_COOLDOWN_MS: number = 30000;
+const PERF_COOLDOWN_MAX_MS: number = 180000;
+const PERF_PROBE_MIN_FPS: number = 45;
 
 const GAIT_HZ: number = 1.0;
 const BREATH_PERIOD: number = 3.6;
@@ -583,6 +590,12 @@ export struct Avatar3D {
   private nodeCount: number = 0;
   private rigNote: string = '';
   private tickMs: number = TICK_FAST;
+  /** 进入慢档的时刻（Date.now），用于判断冷却是否到期 */
+  private slowSince: number = 0;
+  /** 当前冷却时长；试探失败一次翻倍，成功后重置 */
+  private cooldownMs: number = PERF_COOLDOWN_MS;
+  /** 正在试探 60fps 中（区分「正常跑快档」与「试探性快档」） */
+  private probing: boolean = false;
   private tickFails: number = 0;
   private perfAcc: number = 0;
   private perfN: number = 0;
@@ -2364,9 +2377,31 @@ export struct Avatar3D {
     this.perfN++;
     if (this.perfN >= PERF_WINDOW) {
       const fps: number = this.perfN / this.perfAcc;
-      if (this.tickMs === TICK_FAST && this.frame > PERF_WINDOW * 2 && fps < PERF_MIN_FPS) {
+      if (this.probing) {
+        // 试探期：一个窗口后裁决，撑得住就留下，撑不住退回并加长冷却
+        if (fps < PERF_PROBE_MIN_FPS) {
+          this.tickMs = TICK_SLOW;
+          this.probing = false;
+          this.slowSince = Date.now();
+          this.cooldownMs = Math.min(this.cooldownMs * 2, PERF_COOLDOWN_MAX_MS);
+          hilog.info(LOG_DOMAIN, LOG_TAG,
+            'Avatar3D perf probe failed fps=%{public}d back-to-30 cooldown=%{public}dms',
+            Math.round(fps), this.cooldownMs);
+        } else {
+          this.probing = false;
+          this.cooldownMs = PERF_COOLDOWN_MS;
+          hilog.info(LOG_DOMAIN, LOG_TAG,
+            'Avatar3D perf probe ok fps=%{public}d stay-60', Math.round(fps));
+        }
+      } else if (this.tickMs === TICK_FAST && this.frame > PERF_WINDOW * 2 && fps < PERF_MIN_FPS) {
         this.tickMs = TICK_SLOW;
+        this.slowSince = Date.now();
         hilog.info(LOG_DOMAIN, LOG_TAG, 'Avatar3D tick 60->30 downgrade fps=%{public}d', Math.round(fps));
+      } else if (this.tickMs === TICK_SLOW && Date.now() - this.slowSince >= this.cooldownMs) {
+        // 冷却到期：试探性升回 60fps，下一窗口裁决
+        this.tickMs = TICK_FAST;
+        this.probing = true;
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'Avatar3D perf probe 30->60 try');
       } else if (this.frame % (PERF_WINDOW * 4) === 0) {
         hilog.info(LOG_DOMAIN, LOG_TAG, 'Avatar3D perf tick=%{public}dms fps=%{public}d state=%{public}s',
           this.tickMs, Math.round(fps), this.stateName());
