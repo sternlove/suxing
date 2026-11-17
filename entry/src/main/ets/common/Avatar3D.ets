@@ -661,6 +661,8 @@ export struct Avatar3D {
   private speechSpineAx: Vec3 = { x: 0, y: 0, z: 1 };
   private level: number = 0;
   private lastSpeechLog: number = 0;
+  /** 上一帧的语音电平：用于检测「开始说话 / 说完」的边沿，静音期间不打日志 */
+  private lastLv: number = 0;
   private speechFrames: number = 0;
   private mouthWrites: number = 0;
   /** 当前生效的形象（0 写实 / 1 动漫），与 @Prop modelKind 同步 */
@@ -1570,8 +1572,15 @@ export struct Avatar3D {
       sp.rotation = quatMul(qcopy(sp.rotation), qs);
     }
 
+    // 日志噪音治理：静音期间完全不打日志。
+    // 之前每 200ms 无条件打一条（lv=0.00 sil=1.00...），5 条/秒的固定噪音把 hilog 冲满，
+    // 任何真实事件（asr 结果、proactive 触发、错误）都留不下来。
+    // 现在只在「开始说话 / 说完」的边沿各打一条，说话期间每 SPEECH_LOG_MS 采样一条。
     const now: number = Date.now();
-    if (now - this.lastSpeechLog >= SPEECH_LOG_MS) {
+    const speaking: boolean = lv > 0.002;
+    const wasSpeaking: boolean = this.lastLv > 0.002;
+    this.lastLv = lv;
+    if ((speaking !== wasSpeaking) || (speaking && now - this.lastSpeechLog >= SPEECH_LOG_MS)) {
       this.lastSpeechLog = now;
       // 每组权重都回读：写进去和真的生效是两件事
       const rbJaw: string = this.readShape(prof.jawShapes[0]);
