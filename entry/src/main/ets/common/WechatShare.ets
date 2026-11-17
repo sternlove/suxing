@@ -24,19 +24,32 @@ function buildData(record: systemShare.SharedRecord): systemShare.SharedData {
   return new systemShare.SharedData(record);
 }
 
-function showPanel(ctx: common.UIAbilityContext, data: systemShare.SharedData, what: string): Promise<void> {
+/**
+ * 弹分享面板。
+ *
+ * 注意：ShareController 的监听器必须在面板关闭后注销。之前每次分享都注册
+ * shareCompleted / dismiss 两个回调却从不 off，反复分享会累积泄漏 controller 与闭包。
+ */
+async function showPanel(ctx: common.UIAbilityContext, data: systemShare.SharedData, what: string): Promise<void> {
   const controller: systemShare.ShareController = new systemShare.ShareController(data);
-  controller.on('shareCompleted', (r: systemShare.ShareOperationResult) => {
+  const onDone = (r: systemShare.ShareOperationResult): void => {
     hilog.info(TWIN_DOMAIN, TWIN_TAG, 'share %{public}s completed target=%{public}s', what, r.targetAbilityInfo.name);
-  });
-  controller.on('dismiss', () => {
+  };
+  const onDismiss = (): void => {
     hilog.info(TWIN_DOMAIN, TWIN_TAG, 'share %{public}s panel dismissed', what);
-  });
+  };
+  controller.on('shareCompleted', onDone);
+  controller.on('dismiss', onDismiss);
   const options: systemShare.ShareControllerOptions = {
     selectionMode: systemShare.SelectionMode.SINGLE,
     previewMode: systemShare.SharePreviewMode.DEFAULT
   };
-  return controller.show(ctx, options);
+  try {
+    await controller.show(ctx, options);
+  } finally {
+    controller.off('shareCompleted', onDone);
+    controller.off('dismiss', onDismiss);
+  }
 }
 
 /**
