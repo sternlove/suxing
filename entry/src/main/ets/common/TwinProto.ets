@@ -33,13 +33,19 @@ export interface SendApp {
   aliases: string[];
 }
 
+/**
+ * 顺序敏感：正则交替串按词长降序拼接，但同名开头的短词仍可能抢先命中，
+ * 所以「QQ邮箱」必须排在「QQ」之前——否则「给QQ邮箱张三发消息」会被解析成
+ * app=QQ、contact=邮箱张三（真机实测过）。
+ */
 export const SEND_APPS: SendApp[] = [
   { name: '微信', bundle: 'com.tencent.wechat', aliases: ['微信'] },
+  { name: '企业微信', bundle: 'com.tencent.wework.hmos', aliases: ['企业微信'] },
+  { name: 'QQ邮箱', bundle: 'com.tencent.qqmail.hmos', aliases: ['QQ邮箱', 'qq邮箱'] },
   { name: 'QQ', bundle: 'com.tencent.mqq', aliases: ['QQ', 'qq'] },
-  { name: '邮件', bundle: 'com.huawei.hmos.email', aliases: ['邮件', '邮箱'] },
+  { name: '邮箱', bundle: 'com.huawei.hmos.email', aliases: ['邮件', '邮箱'] },
   { name: '备忘录', bundle: 'com.huawei.hmos.notepad', aliases: ['备忘录', '笔记'] },
-  { name: '飞书', bundle: 'com.ss.feishu', aliases: ['飞书'] },
-  { name: '企业微信', bundle: 'com.tencent.wework.hmos', aliases: ['企业微信'] }
+  { name: '飞书', bundle: 'com.ss.feishu', aliases: ['飞书'] }
 ];
 
 /** 一条通用发送意图；app/bundle 为空 = 未指定目标应用（弹分享面板让用户选） */
