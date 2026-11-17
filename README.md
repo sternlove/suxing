@@ -55,6 +55,61 @@ UI        ArkUI 声明式
 人格      Prompt 工程（无微调，全部在 ArkTS 侧拼装）
 ```
 
+## 架构
+
+```mermaid
+graph TD
+    UI["Index.ets<br/>主界面 · 叠层渲染"]
+
+    UI --> Router["AiRouter<br/>端云路由"]
+    UI --> Llama["LlamaBridge<br/>本地推理"]
+    UI --> Mem["Memory<br/>SQLite 记忆"]
+    UI --> Persona["Persona<br/>人格拼装"]
+    UI --> Proactive["Proactive<br/>主动搭话闸门"]
+    UI --> Speech["Speech<br/>TTS · 离线 ASR"]
+    UI --> Proto["TwinProto<br/>指令解析"]
+    UI --> Avatar["Avatar3D<br/>全屏 3D 场景"]
+    UI --> React["AvatarReaction<br/>语义动作映射"]
+
+    Router --> Cloud["CloudApi<br/>云端 SSE"]
+    Mem --> Rag["Rag<br/>BM25 检索"]
+    Proto --> Share["WechatShare<br/>系统分享"]
+    Avatar --> Kit["ModelKit<br/>双模型配置"]
+    Avatar --> Viseme["Viseme<br/>口型驱动"]
+
+    Llama -. "NAPI" .-> Native["libllamaohos.so<br/>llama.cpp 交叉编译"]
+    Cloud -. "HTTPS" .-> API["云端 API"]
+```
+
+## 一次对话的数据流
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant I as Index
+    participant R as Rag
+    participant M as Memory
+    participant P as Persona
+    participant L as LlamaBridge
+    participant T as Speech
+    participant A as Avatar3D
+
+    U->>I: 我喜欢喝什么
+    I->>R: search(query, top3)
+    R->>M: loadDocs(最近 1500 条)
+    M-->>R: 历史文档
+    R-->>I: 相关片段 + 分数
+    I->>P: 拼人格 prompt
+    P-->>I: system prompt（≤200 字）
+    I->>M: 拼上下文（6 轮 + 检索片段）
+    M-->>I: 完整 ChatML
+    I->>L: generateStream
+    L-->>I: 流式 token
+    I->>T: speak(剥离思考链后的正文)
+    T-->>A: 振幅 → 张嘴 + 点头 + 光团
+    I->>M: 落库（存剥离后正文）
+```
+
 ---
 
 ## 构建
