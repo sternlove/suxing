@@ -309,6 +309,10 @@ struct Index {
   private theme: string = THEME_DARK;
   /** 聊天记忆（SQLite）与「最近 N 轮」的内存副本，两者同步维护 */
   private mem: ChatMemory = new ChatMemory();
+  /** 语义检索是否启用（embedding 模型加载成功） */
+  @State vectorReady: boolean = false;
+  /** 已建向量的条数，面板显示用 */
+  @State vecCount: number = 0;
   private history: ChatTurn[] = [];
   /** 本轮 user 文本：回复落地时和 assistant 一起进 history，避免 prompt 里当前句重复 */
   private pendingUserText: string = '';
@@ -927,6 +931,13 @@ struct Index {
 
       // 📤 导出：当前会话 → Markdown / 整库 → .db 备份，都落到沙箱 filesDir/export 再走系统分享
       Row({ space: 8 }) {
+        // 🧠 语义检索：BM25 只认字面，换个说法就漏；导入 bge-small-zh 后按语义补一路
+        Button(this.vectorReady ? ('🧠 语义检索：已启用（' + this.vecCount + ' 条向量）') : '🧠 启用语义检索（选择 bge-*.gguf）')
+          .onClick(() => {
+            this.importEmbedModel();
+          })
+          .margin({ top: 8 })
+
         Button('导出 Markdown')
           .layoutWeight(1)
           .height(34)
@@ -2396,6 +2407,62 @@ struct Index {
    * 为什么要复制：picker 返回的是 file://docs/... 形式的 URI，权限是临时的，
    * llama.cpp 只吃真实文件路径；应用沙箱内的路径才是可长期持有、可直接 mmap 的。
    */
+  private async saveEmbedPath(path: string): Promise<void> {
+    const pref: preferences.Preferences | undefined = this.pref;
+    if (pref === undefined) {
+      return;
+    }
+    try {
+      await pref.put('embedModelPath', path);
+      await pref.flush();
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'saveEmbedPath failed: %{public}s', (e as Error).message);
+    }
+  }
+
+  /**
+   * 导入 embedding 模型并启用语义检索。
+   * 与聊天模型分开：它只用 native 的 embed()，不参与生成。
+   * 失败一律降级为纯 BM25，不阻断任何功能。
+   */
+  private async importEmbedModel(): Promise<void> {
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      options.fileSuffixFilters = ['嵌入模型|.gguf'];
+      const uris: string[] = await docPicker.select(options);
+      if (uris === undefined || uris.length === 0) {
+        return;
+      }
+      this.status = '导入嵌入模型…';
+      const dest: string = await this.stageModel(ctx, uris[0]);
+      if (dest === '') {
+        return;
+      }
+      this.status = '加载嵌入模型…（' + this.humanSize(fs.statSync(dest).size) + '）';
+      await this.nextFrame();
+      const ok: boolean = await this.mem.enableVector(dest);
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'embed import dest=%{public}s ok=%{public}s', dest, '' + ok);
+      if (ok) {
+        this.vectorReady = true;
+        this.vecCount = await this.mem.vectorCount();
+        this.status = '✅ 语义检索已启用（已有 ' + this.vecCount + ' 条向量）';
+        promptAction.showToast({ message: '✅ 语义检索已启用', duration: 2000 });
+        await this.saveEmbedPath(dest);
+      } else {
+        this.vectorReady = false;
+        this.status = '⚠ 嵌入模型加载失败，检索仍用 BM25';
+        promptAction.showToast({ message: '嵌入模型加载失败', duration: 2500 });
+      }
+    } catch (e) {
+      const err: Error = e as Error;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'embed import failed: %{public}s', err.message);
+      this.status = '嵌入模型导入失败：' + err.message;
+    }
+  }
+
   private async importModel(): Promise<void> {
     if (this.loading) {
       return;

@@ -4,6 +4,8 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ChatMsg } from './CloudApi';
 import { buildRagBlock, MemoryHit, RagDoc, scoreDocs, RAG_MIN_SCORE, RAG_TOPK } from './Rag';
+import { Embedder } from './Embedder';
+import { VectorStore, VecRow, VecHit, FusedHit, fuse } from './VectorRag';
 
 /**
  * 聊天记忆：SQLite 落库 + 「最近 N 轮」上下文构造。
@@ -106,9 +108,68 @@ export class ChatMemory {
   private allScope: boolean = false;
   /** 本次启动迁移了多少条老消息到默认会话（面板/日志要报） */
   private migrated: number = 0;
+  /** 向量库：BM25 之外的第二路检索，语义匹配「换个说法」的情况 */
+  private vecStore: VectorStore = new VectorStore();
+  /** 本地 embedding（bge-small-zh，由用户在「📦 模型」导入后启用） */
+  private embedder: Embedder = new Embedder();
+  /** 向量路最近一次贡献的命中数，面板展示用 */
+  private vecHits: number = 0;
 
   isReady(): boolean {
     return this.store !== undefined;
+  }
+
+  /**
+   * 启用向量检索：加载 embedding 模型 + 建向量表。
+   * 失败返回 false，检索自动退回纯 BM25（不影响任何现有功能）。
+   */
+  async enableVector(modelPath: string): Promise<boolean> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined) {
+      return false;
+    }
+    const okTable: boolean = await this.vecStore.init(st);
+    if (!okTable) {
+      return false;
+    }
+    const okModel: boolean = await this.embedder.load(modelPath);
+    hilog.info(MEM_DOMAIN, MEM_TAG, 'vector enabled=%{public}s dim=%{public}d path=%{public}s',
+      '' + okModel, this.embedder.dims(), modelPath);
+    return okModel;
+  }
+
+  isVectorReady(): boolean {
+    return this.embedder.isReady() && this.vecStore.isReady();
+  }
+
+  vectorCount(): Promise<number> {
+    return this.vecStore.count();
+  }
+
+  vectorHitCount(): number {
+    return this.vecHits;
+  }
+
+  /**
+   * 给一条消息补写向量。不 await、不抛：单条失败只记 warn，
+   * 检索时缺少向量就自然少一条候选，不会影响主流程。
+   */
+  private indexVector(msgId: number, sid: number, text: string): void {
+    if (!this.isVectorReady() || msgId <= 0) {
+      return;
+    }
+    const t: string = text.trim();
+    // 太短的消息（「好」「嗯」）没有检索价值，跳过省算力
+    if (t.length < 6) {
+      return;
+    }
+    const v: Float32Array | undefined = this.embedder.embed(t);
+    if (v === undefined) {
+      return;
+    }
+    this.vecStore.put(msgId, sid, v).catch((e: Error) => {
+      hilog.warn(MEM_DOMAIN, MEM_TAG, 'vector put failed msgId=%{public}d: %{public}s', msgId, e.message);
+    });
   }
 
   /** 当前会话 id（0 = 还没定下来） */
@@ -361,6 +422,22 @@ export class ChatMemory {
       if (role === 'user') {
         await this.autoTitle(sid, text);
       }
+      // 向量路：拿到这行的 id 后异步补写（不 await，embedding 有算力开销）
+      if (this.isVectorReady()) {
+        try {
+          const rs: relationalStore.ResultSet = await st.querySql('SELECT last_insert_rowid() AS id', []);
+          try {
+            if (rs.goToFirstRow()) {
+              const mid: number = rs.getLong(rs.getColumnIndex('id'));
+              this.indexVector(mid, sid, text);
+            }
+          } finally {
+            rs.close();
+          }
+        } catch (e) {
+          hilog.warn(MEM_DOMAIN, MEM_TAG, 'vector index skipped: %{public}s', (e as Error).message);
+        }
+      }
       return true;
     } catch (e) {
       hilog.error(MEM_DOMAIN, MEM_TAG, 'memory append failed: %{public}s', (e as Error).message);
@@ -603,6 +680,51 @@ export class ChatMemory {
     hilog.info(MEM_DOMAIN, MEM_TAG,
       'memory search query=[%{public}s] scope=%{public}s session=%{public}d candidates=%{public}d pool=%{public}d hits=%{public}d',
       q.substring(0, 30), this.allScope ? 'all' : 'session', this.cur, this.pool, pool.length, hits.length);
+
+    // 向量路：BM25 只认字面，「我常喝的那杯」和「我最喜欢喝冰美式」没有共同的二元组，
+    // 字面检索必然漏；向量按语义相近度补上这一路。
+    this.vecHits = 0;
+    if (this.isVectorReady() && pool.length > 0) {
+      const qv: Float32Array | undefined = this.embedder.embed(q);
+      if (qv !== undefined) {
+        const rows: VecRow[] = await this.vecStore.load(this.allScope ? -1 : this.cur, RAG_CANDIDATES);
+        if (rows.length > 0) {
+          const vh: VecHit[] = this.vecStore.search(qv, rows, RAG_TOPK * 2);
+          const vecIds: number[] = [];
+          for (const h of vh) {
+            // 只在本次候选池里的消息才参与融合，避免把被会话/窗口过滤掉的旧行拉回来
+            vecIds.push(h.msgId);
+          }
+          this.vecHits = vecIds.length;
+          if (vecIds.length > 0) {
+            const bm25Ids: number[] = [];
+            for (const h of hits) {
+              bm25Ids.push(h.id);
+            }
+            const fused: FusedHit[] = fuse(bm25Ids, vecIds, topK);
+            const byId: Map<number, RagDoc> = new Map<number, RagDoc>();
+            for (const d of pool) {
+              byId.set(d.id, d);
+            }
+            const merged: MemoryHit[] = [];
+            for (const f of fused) {
+              const d: RagDoc | undefined = byId.get(f.msgId);
+              if (d === undefined) {
+                continue;
+              }
+              merged.push({ id: d.id, role: d.role, text: d.text, ts: d.ts, score: f.score });
+            }
+            if (merged.length > 0) {
+              hilog.info(MEM_DOMAIN, MEM_TAG,
+                'memory vector fuse bm25=%{public}d vec=%{public}d out=%{public}d top=[%{public}s]',
+                bm25Ids.length, vecIds.length, merged.length,
+                merged.slice(0, 3).map((m: MemoryHit) => m.id + ':' + m.score.toFixed(4)).join(','));
+              return merged;
+            }
+          }
+        }
+      }
+    }
     let top: number = 0;
     for (const h of hits) {
       if (h.score > top) {

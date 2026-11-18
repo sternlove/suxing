@@ -23,6 +23,12 @@ export interface LlamaLoadOptions {
   minP?: number;
   /** 随机种子，缺省 0，允许 0..1000000 */
   seed?: number;
+  /**
+   * embedding 模式：1 开启（0 或缺省 = 普通生成）。
+   * 开启后上下文用 MEAN pooling 且窗口固定 512，仅用于 embed() 取句向量，
+   * 不要拿这个 handle 去 generateStream。
+   */
+  embedding?: number;
 }
 
 export interface LlamaParams {
@@ -55,6 +61,11 @@ export interface LlamaNativeApi {
   releaseContext(handle: number): boolean;
   /** 回读当前生效的推理参数 */
   getParams(handle: number): LlamaParams;
+  /**
+   * 文本 → 句向量（长度 = 模型 n_embd，bge-small-zh 是 512）。
+   * 仅当 loadModel 时传了 embedding:1 才可用；同步返回，失败抛异常。
+   */
+  embed(handle: number, text: string): number[];
 }
 
 export const createContext: () => number;
@@ -62,6 +73,7 @@ export const loadModel: (handle: number, path: string, options?: LlamaLoadOption
 export const generateStream: (handle: number, prompt: string, onToken: (partial: string) => void,
                               onDone?: (code: number, finalText: string) => void) => void;
 export const cancel: (handle: number) => void;
+export const embed: (handle: number, text: string) => number[];
 export const releaseContext: (handle: number) => boolean;
 export const getParams: (handle: number) => LlamaParams;
 

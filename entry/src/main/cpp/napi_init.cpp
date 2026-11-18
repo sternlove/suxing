@@ -71,6 +71,9 @@ struct Session {
     int32_t             n_batch   = kDefaultNBatch;
     int32_t             n_predict = kDefaultNPredict;
     int32_t             n_threads = 0; // 0 = 按 CPU 核数自动
+    // embedding 模式：loadModel(handle, path, { embedding: true }) 打开。
+    // 开启后 ctx 用 MEAN pooling，供 embed() 取句向量（BM25 之外的第二路检索）。
+    bool                embeddingMode = false;
 
     // 采样参数：temperature <= 0 时走贪心（与旧行为逐位一致），否则构建采样链
     float               temperature = 0.0f;
@@ -585,6 +588,12 @@ napi_value LoadModel(napi_env env, napi_callback_info info) {
                 !ReadIntOption(env, args[2], "nThreads", "loadModel", 1, 16, &n_threads)) {
                 return OkValue(env);
             }
+            int32_t embFlag = session->embeddingMode ? 1 : 0;
+            if (!ReadIntOption(env, args[2], "embedding", "loadModel", 0, 1, &embFlag)) {
+                return OkValue(env);
+            }
+            session->embeddingMode = (embFlag == 1);
+
             if (n_predict >= n_ctx) {
                 char msg[160];
                 snprintf(msg, sizeof(msg), "loadModel: nPredict(%d) 必须小于 nCtx(%d)", n_predict, n_ctx);
@@ -663,6 +672,14 @@ napi_value LoadModel(napi_env env, napi_callback_info info) {
                                      : static_cast<int32_t>(hw_threads == 0 ? 4u : std::min(hw_threads, 6u));
     ctx_params.n_threads       = threads;
     ctx_params.n_threads_batch = threads;
+    if (session->embeddingMode) {
+        // embedding 单条文本不需要长上下文；开 pooling 才能取到句向量
+        ctx_params.n_ctx           = 512;
+        ctx_params.n_batch         = 512;
+        ctx_params.n_ubatch        = 512;
+        ctx_params.embeddings      = true;
+        ctx_params.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
+    }
 
     session->ctx = llama_init_from_model(session->model, ctx_params);
     if (session->ctx == nullptr) {
@@ -921,6 +938,89 @@ napi_value GetParams(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// 文本 → 句向量。仅当 loadModel 时 embedding:true 才可用。
+// 返回 number[]（长度 = 模型 n_embd），失败抛 Error。
+napi_value Embed(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    const napi_status cb_status = napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (cb_status != napi_ok) {
+        ThrowNapi(env, "embed", "napi_get_cb_info", cb_status);
+        return OkValue(env);
+    }
+    if (!RequireArgc(env, argc, 2, "embed")) {
+        return OkValue(env);
+    }
+    int64_t handle = 0;
+    if (!ArgHandle(env, args[0], "embed", &handle)) {
+        return OkValue(env);
+    }
+    std::shared_ptr<Session> session = RequireSession(env, handle, "embed");
+    if (session == nullptr || session->ctx == nullptr || session->vocab == nullptr) {
+        ThrowError(env, "ERR_NOT_LOADED", "embed: 该 handle 尚未 loadModel");
+        return OkValue(env);
+    }
+    if (!session->embeddingMode) {
+        ThrowError(env, "ERR_NOT_EMBEDDING",
+                   "embed: 该 handle 不是 embedding 模式，loadModel 时需传 { embedding: true }");
+        return OkValue(env);
+    }
+    std::string text;
+    if (!ArgString(env, args[1], "embed", "text", &text)) {
+        return OkValue(env);
+    }
+    if (text.empty()) {
+        ThrowError(env, "ERR_INVALID_ARG_VALUE", "embed: text 不能为空");
+        return OkValue(env);
+    }
+
+    std::lock_guard<std::mutex> lock(session->mu);
+
+    const int32_t cap = static_cast<int32_t>(llama_n_ctx(session->ctx));
+    std::vector<llama_token> tokens(static_cast<size_t>(cap));
+    int32_t n = llama_tokenize(session->vocab, text.c_str(), static_cast<int32_t>(text.size()),
+                               tokens.data(), static_cast<int32_t>(tokens.size()), true, true);
+    if (n < 0) {
+        ThrowError(env, "ERR_TOKENIZE", "embed: 分词失败（文本超过上下文窗口）");
+        return OkValue(env);
+    }
+    if (n == 0) {
+        ThrowError(env, "ERR_INVALID_ARG_VALUE", "embed: 分词结果为空");
+        return OkValue(env);
+    }
+    tokens.resize(static_cast<size_t>(n));
+
+    llama_memory_t mem = llama_get_memory(session->ctx);
+    if (mem != nullptr) {
+        llama_memory_clear(mem, true);
+    }
+    llama_batch batch = llama_batch_get_one(tokens.data(), n);
+    if (llama_decode(session->ctx, batch) != 0) {
+        ThrowError(env, "ERR_DECODE", "embed: llama_decode 失败（上下文或内存不足）");
+        return OkValue(env);
+    }
+
+    float * emb = llama_get_embeddings(session->ctx);
+    if (emb == nullptr) {
+        ThrowError(env, "ERR_NO_EMBEDDINGS", "embed: 模型没有输出 embedding（检查 pooling_type）");
+        return OkValue(env);
+    }
+    const int32_t dim = static_cast<int32_t>(llama_model_n_embd(session->model));
+    napi_value arr = nullptr;
+    if (napi_create_array_with_length(env, static_cast<size_t>(dim), &arr) != napi_ok) {
+        ThrowNapi(env, "embed", "napi_create_array_with_length", napi_generic_failure);
+        return OkValue(env);
+    }
+    for (int32_t i = 0; i < dim; i++) {
+        double v = static_cast<double>(emb[i]);
+        napi_value num = nullptr;
+        if (napi_create_double(env, v, &num) == napi_ok) {
+            napi_set_element(env, arr, static_cast<uint32_t>(i), num);
+        }
+    }
+    return arr;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
         {"createContext",  nullptr, CreateContext,  nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -929,6 +1029,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"cancel",         nullptr, Cancel,         nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseContext", nullptr, ReleaseContext, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getParams",      nullptr, GetParams,      nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"embed",          nullptr, Embed,          nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     const size_t count = sizeof(desc) / sizeof(desc[0]);
     const napi_status st = napi_define_properties(env, exports, count, desc);
