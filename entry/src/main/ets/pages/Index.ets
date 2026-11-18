@@ -343,7 +343,10 @@ struct Index {
     this.initSettings().catch((e: Error) => {
       this.status = '读取配置失败：' + e.message;
     });
-    this.initMemory().catch((e: Error) => {
+    this.initMemory().then(() => {
+      // 记忆就绪后才能建向量表/加载 embedding —— 顺序不能反
+      this.autoLoadEmbedding();
+    }).catch((e: Error) => {
       this.status = '读取聊天记录失败：' + e.message;
       hilog.error(LOG_DOMAIN, LOG_TAG, 'initMemory failed: %{public}s', e.message);
     });
@@ -2495,6 +2498,9 @@ struct Index {
           const okCached: boolean = await this.mem.enableVector(dest);
           this.vectorReady = okCached;
           this.vecCount = okCached ? await this.mem.vectorCount() : 0;
+          if (okCached) {
+            await this.saveEmbedPath(dest);
+          }
           this.status = okCached ? '✅ 语义检索已启用（已有 ' + this.vecCount + ' 条向量）' : '⚠ 加载失败，检索仍用 BM25';
           return;
         }
@@ -2535,11 +2541,58 @@ struct Index {
       const okLoad: boolean = await this.mem.enableVector(dest);
       this.vectorReady = okLoad;
       this.vecCount = okLoad ? await this.mem.vectorCount() : 0;
+      if (okLoad) {
+        // 关键：存下来，否则下次启动 autoload 找不到路径，语义检索会静默失效
+        await this.saveEmbedPath(dest);
+      }
       this.status = okLoad ? '✅ 语义检索已启用（已有 ' + this.vecCount + ' 条向量）' : '⚠ 加载失败，检索仍用 BM25';
     } catch (e) {
       const err: Error = e as Error;
       hilog.error(LOG_DOMAIN, LOG_TAG, 'embed download error: %{public}s', err.message);
       this.status = '嵌入模型下载失败：' + err.message;
+    }
+  }
+
+  /**
+   * 启动时自动加载已下载/导入的 embedding 模型。
+   *
+   * 之前只在「下载」或「导入」的回调里加载，App 一重启 vectorReady 就变 false，
+   * 之后就再也不写向量了 —— 表现为「语义检索启用过，但一条向量都没有」。
+   */
+  private async autoLoadEmbedding(): Promise<void> {
+    try {
+      const pref: preferences.Preferences | undefined = this.pref;
+      if (pref === undefined) {
+        return;
+      }
+      const ep: preferences.ValueType = pref.getSync('embedModelPath', '');
+      let path: string = typeof ep === 'string' ? ep : '';
+      // 兜底：老版本下载过的模型没写 preferences，但文件还在沙箱里。
+      // 不补这一步，用户会遇到「明明下载过，重启后语义检索又没了」。
+      if (path === '' || !fs.accessSync(path)) {
+        const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+        const guess: string = ctx.filesDir + '/embed/bge-q8.gguf';
+        if (fs.accessSync(guess) && fs.statSync(guess).size > 20000000) {
+          path = guess;
+          hilog.info(LOG_DOMAIN, LOG_TAG, 'embed autoload found cached model size=%{public}d',
+            fs.statSync(guess).size);
+        }
+      }
+      if (path === '' || !fs.accessSync(path)) {
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'embed autoload skipped path=[%{public}s]', path);
+        return;
+      }
+      const ok: boolean = await this.mem.enableVector(path);
+      this.vectorReady = ok;
+      if (ok) {
+        this.vecCount = await this.mem.vectorCount();
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'embed autoload ok vectors=%{public}d path=[%{public}s]',
+          this.vecCount, path);
+      } else {
+        hilog.warn(LOG_DOMAIN, LOG_TAG, 'embed autoload failed path=[%{public}s]', path);
+      }
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'embed autoload error: %{public}s', (e as Error).message);
     }
   }
 
