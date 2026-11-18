@@ -89,6 +89,7 @@ import {
 } from '../common/Persona';
 import { Avatar3D } from '../common/Avatar3D';
 import { ProactiveReminder } from '../common/Reminder';
+import { CardData, cardSnippet, writeCardData, pushCard } from '../common/CardBridge';
 import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
 import {
@@ -1478,6 +1479,7 @@ struct Index {
 
   /** 一轮收尾：这一问一答进内存 history，assistant 那行落库。流式中间态不进这里。 */
   private finishTurn(reply: string, modeName: string): void {
+    this.updateWidget();
     const ask: string = this.pendingUserText;
     this.pendingUserText = '';
     if (reply === '') {
@@ -2593,6 +2595,34 @@ struct Index {
       }
     } catch (e) {
       hilog.warn(LOG_DOMAIN, LOG_TAG, 'embed autoload error: %{public}s', (e as Error).message);
+    }
+  }
+
+  /**
+   * 把当前状态推给桌面小组件。
+   * 卡片在独立进程，只能通过沙箱文件 + updateForm 传递；失败不影响主流程。
+   */
+  private updateWidget(): void {
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      let last: string = '';
+      for (let i = this.lines.length - 1; i >= 0; i--) {
+        if (this.lines[i].role === 'assistant') {
+          last = this.lines[i].text;
+          break;
+        }
+      }
+      const d: CardData = {
+        face: this.emoFace === '' ? '😐' : this.emoFace,
+        snippet: cardSnippet(last),
+        status: this.vectorReady ? '🧠 语义检索 · 💭 主动搭话' : '💭 主动搭话开启'
+      };
+      writeCardData(ctx.filesDir, d);
+      pushCard(ctx.filesDir, d).catch((e: Error) => {
+        hilog.warn(LOG_DOMAIN, LOG_TAG, 'widget push failed: %{public}s', e.message);
+      });
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'widget update error: %{public}s', (e as Error).message);
     }
   }
 

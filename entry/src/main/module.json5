@@ -47,6 +47,20 @@
             "resource": "$profile:accessibility_config"
           }
         ]
+      },
+      {
+        // 桌面小组件：卡片在独立进程，数据经沙箱文件（CardBridge）传递
+        "name": "EntryFormAbility",
+        "srcEntry": "./ets/formability/EntryFormAbility.ets",
+        "description": "$string:widget_desc",
+        "type": "form",
+        "metadata": [
+          {
+            "name": "ohos.extension.form",
+            "resource": "$profile:form_config"
+          }
+        ],
+        "exported": true
       }
     ],
     "requestPermissions": [

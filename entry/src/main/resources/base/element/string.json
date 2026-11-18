@@ -1,11 +1,40 @@
 {
   "string": [
-    { "name": "module_desc", "value": "苏兴 主机版主模块" },
-    { "name": "EntryAbility_desc", "value": "苏兴" },
-    { "name": "EntryAbility_label", "value": "苏兴" },
-    { "name": "reason_download_dir", "value": "导入本地 gguf 模型文件需要读取下载目录" },
-    { "name": "reason_microphone", "value": "按住说话需要麦克风，把你的语音转成文字填进输入框" },
-    { "name": "twin_accessibility_label", "value": "苏兴无障碍" },
-    { "name": "twin_accessibility_desc", "value": "读取屏幕内容并模拟点击，用于替你自动操作微信等应用" }
+    {
+      "name": "module_desc",
+      "value": "苏兴 主机版主模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "苏兴"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "苏兴"
+    },
+    {
+      "name": "reason_download_dir",
+      "value": "导入本地 gguf 模型文件需要读取下载目录"
+    },
+    {
+      "name": "reason_microphone",
+      "value": "按住说话需要麦克风，把你的语音转成文字填进输入框"
+    },
+    {
+      "name": "twin_accessibility_label",
+      "value": "苏兴无障碍"
+    },
+    {
+      "name": "twin_accessibility_desc",
+      "value": "读取屏幕内容并模拟点击，用于替你自动操作微信等应用"
+    },
+    {
+      "name": "widget_desc",
+      "value": "苏兴：情绪与最近一句"
+    },
+    {
+      "name": "widget_name",
+      "value": "苏兴"
+    }
   ]
 }
