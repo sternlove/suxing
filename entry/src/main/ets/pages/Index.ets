@@ -25,6 +25,7 @@ import {
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { preferences } from '@kit.ArkData';
 import { pasteboard } from '@kit.BasicServicesKit';
+import { request } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
 import { AiRouter, RouteMode } from '../common/AiRouter';
@@ -935,6 +936,12 @@ struct Index {
         Button(this.vectorReady ? ('🧠 语义检索：已启用（' + this.vecCount + ' 条向量）') : '🧠 启用语义检索（选择 bge-*.gguf）')
           .onClick(() => {
             this.importEmbedModel();
+          })
+          .margin({ top: 8 })
+
+        Button('⬇️ 自动下载嵌入模型（26MB）')
+          .onClick(() => {
+            this.downloadEmbedModel();
           })
           .margin({ top: 8 })
 
@@ -2460,6 +2467,79 @@ struct Index {
       const err: Error = e as Error;
       hilog.error(LOG_DOMAIN, LOG_TAG, 'embed import failed: %{public}s', err.message);
       this.status = '嵌入模型导入失败：' + err.message;
+    }
+  }
+
+  /**
+   * 自动下载 embedding 模型到沙箱再加载。
+   *
+   * 为什么要有这条路：hdc 的 shell 用户写不了用户的 Download 目录（实测全部 Permission denied），
+   * 手工「导入文件」在自动化验证里走不通。App 自己有 READ_WRITE_DOWNLOAD_DIRECTORY，
+   * 让它自己下载最省事，用户点一下就行。
+   */
+  private async downloadEmbedModel(): Promise<void> {
+    const DL_URL: string = 'https://hf-mirror.com/CompendiumLabs/bge-small-zh-v1.5-gguf/resolve/main/bge-small-zh-v1.5-q8_0.gguf';
+    const MIN_BYTES: number = 20000000;
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const dir: string = ctx.filesDir + '/embed';
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir);
+      }
+      const dest: string = dir + '/bge-q8.gguf';
+      if (fs.accessSync(dest)) {
+        const size: number = fs.statSync(dest).size;
+        if (size >= MIN_BYTES) {
+          this.status = '检测到已下载的嵌入模型，直接加载…';
+          await this.nextFrame();
+          const okCached: boolean = await this.mem.enableVector(dest);
+          this.vectorReady = okCached;
+          this.vecCount = okCached ? await this.mem.vectorCount() : 0;
+          this.status = okCached ? '✅ 语义检索已启用（已有 ' + this.vecCount + ' 条向量）' : '⚠ 加载失败，检索仍用 BM25';
+          return;
+        }
+      }
+      this.status = '⬇️ 下载嵌入模型…（26MB，网络慢时需要几分钟）';
+      await this.nextFrame();
+      const task: request.DownloadTask = await request.downloadFile(ctx, {
+        url: DL_URL,
+        filePath: dest,
+        enableMetered: true,
+        enableRoaming: true,
+        description: 'bge-small-zh embedding model'
+      });
+      const ok: boolean = await new Promise<boolean>((resolve: (v: boolean) => void) => {
+        let done: boolean = false;
+        task.on('complete', () => {
+          if (!done) {
+            done = true;
+            resolve(true);
+          }
+        });
+        task.on('fail', (err: number) => {
+          hilog.error(LOG_DOMAIN, LOG_TAG, 'embed download failed err=%{public}d', err);
+          if (!done) {
+            done = true;
+            resolve(false);
+          }
+        });
+      });
+      if (!ok) {
+        this.status = '⚠ 下载失败，检索仍用 BM25';
+        return;
+      }
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'embed download complete dest=%{public}s size=%{public}d',
+        dest, fs.statSync(dest).size);
+      this.status = '加载嵌入模型…';
+      await this.nextFrame();
+      const okLoad: boolean = await this.mem.enableVector(dest);
+      this.vectorReady = okLoad;
+      this.vecCount = okLoad ? await this.mem.vectorCount() : 0;
+      this.status = okLoad ? '✅ 语义检索已启用（已有 ' + this.vecCount + ' 条向量）' : '⚠ 加载失败，检索仍用 BM25';
+    } catch (e) {
+      const err: Error = e as Error;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'embed download error: %{public}s', err.message);
+      this.status = '嵌入模型下载失败：' + err.message;
     }
   }
 
