@@ -57,6 +57,10 @@
         "name": "ohos.permission.GET_NETWORK_INFO"
       },
       {
+        // 后台主动搭话：App 退到前台后 JS 定时器被系统挂起，只能用系统级代理提醒唤起
+        "name": "ohos.permission.PUBLISH_AGENT_REMINDER"
+      },
+      {
         "name": "ohos.permission.MICROPHONE",
         "reason": "$string:reason_microphone",
         "usedScene": {

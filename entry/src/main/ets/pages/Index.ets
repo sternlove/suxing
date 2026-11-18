@@ -62,6 +62,7 @@ import {
   ProactiveGate,
   ProactiveTracker,
   effectiveHour,
+  isQuietHour,
   buildProactivePrompt,
   cleanProactive,
   periodName
@@ -86,6 +87,8 @@ import {
   clipForPrompt
 } from '../common/Persona';
 import { Avatar3D } from '../common/Avatar3D';
+import { ProactiveReminder } from '../common/Reminder';
+import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
 import {
   matchReaction,
@@ -322,6 +325,10 @@ struct Index {
   private bannedNames: string[] = [];
   /** 💭 主动搭话状态机 + 前台定时器句柄（-1 = 没在跑） */
   private proactive: ProactiveTracker = new ProactiveTracker();
+  /** 后台搭话：App 退到前台后前台定时器被挂起，只能靠系统代理提醒唤起 */
+  private reminder: ProactiveReminder = new ProactiveReminder();
+  /** 通知授权：代理提醒依赖它（未授权时系统报 1700002，非常误导） */
+  private notify: NotifyCenter = new NotifyCenter();
   private tickId: number = -1;
   /** 正在生成/展示一次主动搭话（防止 await 期间下一个 tick 再进来） */
   private proBusy: boolean = false;
@@ -345,6 +352,13 @@ struct Index {
   onPageShow(): void {
     this.proactive.reset(Date.now());
     this.startTicker();
+    // 回到前台：前台定时器接管，撤掉后台的代理提醒（否则它会在前台也弹一条）
+    this.reminder.cancel().catch((e: Error) => {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'reminder cancel on show failed: %{public}s', e.message);
+    });
+    // 代理提醒依赖通知权限：必须在前台时请求（后台弹不出授权框）。
+    // 未授权时系统会把 publishReminder 拒成 1700002，错误码完全不提权限，极易误判成配额问题。
+    this.ensureNotifyPermission();
     hilog.info(LOG_DOMAIN, LOG_TAG, 'proactive ticker start idleMs=%{public}d debugHour=%{public}d',
       PROACTIVE_IDLE_MS, PROACTIVE_DEBUG_HOUR);
   }
@@ -353,6 +367,29 @@ struct Index {
   onPageHide(): void {
     this.stopTicker();
     hilog.info(LOG_DOMAIN, LOG_TAG, 'proactive ticker stop');
+    // 后台搭话：前台定时器停了，改用系统代理提醒。
+    // 剩余时间按「距最后一次交互」算，至少留 60 秒缓冲，避免刚切后台就弹。
+    const now: number = Date.now();
+    const hour: number = effectiveHour(now);
+    if (isQuietHour(hour)) {
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'reminder skip reason=quiet hour=%{public}d', hour);
+      return;
+    }
+    const idleMs: number = now - this.proactive.lastInteraction();
+    const remainSec: number = Math.max(60, Math.ceil((PROACTIVE_IDLE_MS - idleMs) / 1000));
+    this.reminder.schedule(remainSec, hour).catch((e: Error) => {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'reminder schedule failed: %{public}s', e.message);
+    });
+  }
+
+  /** 首次进前台时请求通知授权；已授权/已问过则直接返回，不反复骚扰 */
+  private ensureNotifyPermission(): void {
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    this.notify.ensure(ctx).then((ok: boolean) => {
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'notify permission ready granted=%{public}s', '' + ok);
+    }).catch((e: Error) => {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'notify permission check failed: %{public}s', e.message);
+    });
   }
 
   aboutToDisappear(): void {
