@@ -95,6 +95,8 @@ import { Skill, SkillEnv, SkillResult, SkillRegistry } from '../common/Skill';
 import { clipboardSkill } from '../skills/ClipboardSkill';
 import { makeSkillsSkill } from '../skills/SkillsSkill';
 import { systemSkill } from '../skills/SystemSkill';
+import { McpClient } from '../common/McpClient';
+import { makeMcpSkills } from '../skills/McpSkillBridge';
 import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
 import {
@@ -322,6 +324,9 @@ struct Index {
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
   /** 系统状态：电量与充电（借鉴 Jarvis 的 sys status 可视化，只取无需权限的项） */
+  /** MCP 连接状态（面板显示） */
+  @State mcpStatus: string = '未连接';
+  private mcpClients: McpClient[] = [];
   @State batteryPct: number = -1;
   @State charging: boolean = false;
   @State vectorReady: boolean = false;
@@ -991,6 +996,18 @@ struct Index {
             this.downloadEmbedModel();
           })
           .margin({ top: 8 })
+
+        // 🔌 MCP：外部工具接入，连上后工具自动变成技能
+        Text('🔌 MCP：' + this.mcpStatus)
+          .fontSize(12)
+          .fontColor(this.pal().textDim)
+          .width('100%')
+          .margin({ top: 8 })
+        Button('从剪贴板连接 MCP server')
+          .onClick(() => {
+            this.connectMcpFromClipboard();
+          })
+          .margin({ top: 4 })
 
         Button('导出 Markdown')
           .layoutWeight(1)
@@ -2657,6 +2674,48 @@ struct Index {
       this.charging = batteryInfo.chargingStatus === batteryInfo.BatteryChargeState.ENABLE;
     } catch (e) {
       // 个别 ROM 上 batteryInfo 可能不可用，忽略
+    }
+  }
+
+  /**
+   * 从剪贴板读 URL 并连接 MCP server。
+   *
+   * 为什么用剪贴板而不是面板输入框：面板已经很长，加一个输入框要动布局；
+   * 剪贴板路径对用户也更省事（复制 → 点一下）。连上后工具自动注册成技能，
+   * 用户说工具名就能调用。
+   */
+  private async connectMcpFromClipboard(): Promise<void> {
+    try {
+      const data: pasteboard.PasteData = await pasteboard.getSystemPasteboard().getData();
+      const url: string = (data.getPrimaryText() ?? '').trim();
+      if (!url.startsWith('http')) {
+        this.mcpStatus = '剪贴板不是 http(s) URL';
+        promptAction.showToast({ message: '先复制 MCP server 的 URL', duration: 2000 });
+        return;
+      }
+      this.mcpStatus = '连接中…';
+      await this.nextFrame();
+      const label: string = 'mcp' + (this.mcpClients.length + 1);
+      const client: McpClient = new McpClient(label, url);
+      const ok: boolean = await client.connect();
+      if (!ok) {
+        this.mcpStatus = '连接失败（检查 URL / 服务是否在跑）';
+        hilog.warn(LOG_DOMAIN, LOG_TAG, 'mcp connect failed url=[%{public}s]', url);
+        return;
+      }
+      this.mcpClients.push(client);
+      const skills: Skill[] = makeMcpSkills(client);
+      for (let i = 0; i < skills.length; i++) {
+        this.skills.register(skills[i]);
+      }
+      this.mcpStatus = label + ' 已连接，' + skills.length + ' 个工具';
+      this.status = '🔌 MCP 已接入 ' + skills.length + ' 个工具';
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'mcp connected label=%{public}s url=[%{public}s] tools=%{public}d',
+        label, url, skills.length);
+    } catch (e) {
+      const err: Error = e as Error;
+      this.mcpStatus = '连接异常：' + err.message;
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'mcp connect error: %{public}s', err.message);
     }
   }
 
