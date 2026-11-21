@@ -91,6 +91,10 @@ import {
 import { Avatar3D } from '../common/Avatar3D';
 import { ProactiveReminder } from '../common/Reminder';
 import { CardData, cardSnippet, writeCardData, pushCard } from '../common/CardBridge';
+import { Skill, SkillEnv, SkillResult, SkillRegistry } from '../common/Skill';
+import { clipboardSkill } from '../skills/ClipboardSkill';
+import { makeSkillsSkill } from '../skills/SkillsSkill';
+import { systemSkill } from '../skills/SystemSkill';
 import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
 import {
@@ -312,6 +316,8 @@ struct Index {
   private theme: string = THEME_DARK;
   /** 聊天记忆（SQLite）与「最近 N 轮」的内存副本，两者同步维护 */
   private mem: ChatMemory = new ChatMemory();
+  /** 技能注册表：动作型请求走这里，不必再往 Index 里塞方法（借鉴 Jarvis plugins） */
+  private skills: SkillRegistry = new SkillRegistry();
   /** 语义检索是否启用（embedding 模型加载成功） */
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
@@ -347,6 +353,10 @@ struct Index {
 
   aboutToAppear(): void {
     this.initSpeech();
+    // 技能注册：顺序即优先级
+    this.skills.register(clipboardSkill);
+    this.skills.register(makeSkillsSkill(() => this.skills.names()));
+    this.skills.register(systemSkill);
     this.initSettings().catch((e: Error) => {
       this.status = '读取配置失败：' + e.message;
     });
@@ -2868,6 +2878,43 @@ struct Index {
       return;
     }
     hilog.info(LOG_DOMAIN, LOG_TAG, 'intent none -> normal chat');
+
+    // 技能分发：动作型请求（「看看剪贴板」「你会什么」），命中就不再走模型
+    const matched: Skill | undefined = this.skills.match(text);
+    if (matched !== undefined) {
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'skill hit id=%{public}s in=[%{public}s]',
+        matched.id, text.substring(0, 30));
+      this.generating = true;
+      try {
+        const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+        const env: SkillEnv = {
+          ctx: ctx,
+          filesDir: ctx.filesDir,
+          say: (t: string) => {
+            this.lines.push({ role: 'assistant', text: t });
+          },
+          status: (t: string) => {
+            this.status = t;
+          }
+        };
+        const res: SkillResult = await matched.run(text, env);
+        if (res.handled) {
+          if (res.reply !== '') {
+            this.lines.push({ role: 'assistant', text: res.reply });
+            this.speakReply(res.reply);
+          }
+          this.finishTurn(res.reply, matched.name);
+          return;
+        }
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'skill declined id=%{public}s -> fallthrough', matched.id);
+      } catch (e) {
+        // 技能出错不阻断对话：记一条 warn，继续走模型
+        hilog.warn(LOG_DOMAIN, LOG_TAG, 'skill failed id=%{public}s: %{public}s',
+          matched.id, (e as Error).message);
+      } finally {
+        this.generating = false;
+      }
+    }
 
     // 人格内核：先吸收这句里的显式偏好、微调情绪，再决定让谁回答
     await this.ensurePersona();
