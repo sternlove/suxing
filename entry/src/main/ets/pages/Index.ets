@@ -25,6 +25,7 @@ import {
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { preferences } from '@kit.ArkData';
 import { pasteboard } from '@kit.BasicServicesKit';
+import { batteryInfo } from '@kit.BasicServicesKit';
 import { request } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
@@ -51,7 +52,7 @@ import {
   safeFileStem,
   buildSessionMarkdown
 } from '../common/Memory';
-import { Palette, THEME_DARK, THEME_LIGHT, paletteOf, themeLabel } from '../common/Theme';
+import { Palette, THEME_DARK, THEME_LIGHT, ALL_THEMES, paletteOf, themeLabel } from '../common/Theme';
 import { MemoryHit, RAG_TOPK, buildRagBlock, pickFresh, oneLine } from '../common/Rag';
 import {
   PROACTIVE_TICK_MS,
@@ -312,6 +313,11 @@ struct Index {
   /** 聊天记忆（SQLite）与「最近 N 轮」的内存副本，两者同步维护 */
   private mem: ChatMemory = new ChatMemory();
   /** 语义检索是否启用（embedding 模型加载成功） */
+  /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
+  @State subtitle: string = '';
+  /** 系统状态：电量与充电（借鉴 Jarvis 的 sys status 可视化，只取无需权限的项） */
+  @State batteryPct: number = -1;
+  @State charging: boolean = false;
   @State vectorReady: boolean = false;
   /** 已建向量的条数，面板显示用 */
   @State vecCount: number = 0;
@@ -359,6 +365,7 @@ struct Index {
 
   /** 回到前台：静默计时从现在算起，并启动 30 秒一次的检查（后台绝不检查、不发通知） */
   onPageShow(): void {
+    this.refreshSysInfo();
     this.proactive.reset(Date.now());
     this.startTicker();
     // 回到前台：前台定时器接管，撤掉后台的代理提醒（否则它会在前台也弹一条）
@@ -528,6 +535,13 @@ struct Index {
               .constraintSize({ maxWidth: '32%' })
               .margin({ right: 6 })
           }
+          // 系统状态：电量（借鉴 Jarvis 的 sys status；只取无需权限的项）
+          if (this.batteryPct >= 0) {
+            Text((this.charging ? '⚡' : '🔋') + this.batteryPct + '%')
+              .fontSize(10)
+              .fontColor((this.batteryPct <= 20 && !this.charging) ? this.pal().errSoft : this.pal().textMuted)
+              .margin({ right: 8 })
+          }
           Text(this.status)
             .fontSize(11)
             .fontColor(this.pal().textMuted)
@@ -564,6 +578,27 @@ struct Index {
         .padding(16)
         .backgroundColor(this.pal().bgList)
 
+        // 实时字幕：朗读时把当前这句显示出来，点一下即打断（借鉴 Jarvis subtitles）
+        if (this.subtitle !== '') {
+          Row() {
+            Text(this.subtitle)
+              .fontSize(15)
+              .fontColor('#F0F0F5')
+              .textAlign(TextAlign.Center)
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width('92%')
+          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+          .margin({ bottom: 6 })
+          .backgroundColor('#CC101018')
+          .borderRadius(12)
+          .onClick(() => {
+            this.stopSpeaking();
+          })
+        }
+
         Row({ space: 8 }) {
           Button(this.listening ? '🎙' : '🎤')
             .width(46)
@@ -574,6 +609,9 @@ struct Index {
             .fontColor(this.pal().text)
             .onTouch((event: TouchEvent) => {
               if (event.type === TouchType.Down) {
+                // 打断：先停朗读再开麦。否则麦克风会录到自己的声音，
+                // 识别出的是 TTS 刚念的那句话（借鉴 Jarvis 的 barge-in 思路）
+                this.stopSpeaking();
                 this.startListening();
               } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
                 this.stopListen();
@@ -913,24 +951,19 @@ struct Index {
           .fontSize(13)
           .fontColor(this.pal().textDim)
           .layoutWeight(1)
-        Button('深色')
-          .height(30)
-          .fontSize(12)
-          .borderRadius(15)
-          .backgroundColor(this.themeDark ? this.pal().primary : this.pal().btnBg)
-          .fontColor(this.themeDark ? this.pal().bubbleUserText : this.pal().text)
-          .onClick(() => {
-            this.saveTheme(THEME_DARK);
-          })
-        Button('浅色')
-          .height(30)
-          .fontSize(12)
-          .borderRadius(15)
-          .backgroundColor(this.themeDark ? this.pal().btnBg : this.pal().primary)
-          .fontColor(this.themeDark ? this.pal().text : this.pal().bubbleUserText)
-          .onClick(() => {
-            this.saveTheme(THEME_LIGHT);
-          })
+        // 皮肤列表：主题只换配色，3D 层不参与（借鉴 Jarvis 多皮肤思路）
+        ForEach(ALL_THEMES, (t: string) => {
+          Button(paletteOf(t).label)
+            .height(30)
+            .fontSize(12)
+            .borderRadius(15)
+            .margin({ left: 4 })
+            .backgroundColor(this.theme === t ? this.pal().primary : this.pal().btnBg)
+            .fontColor(this.theme === t ? this.pal().bubbleUserText : this.pal().text)
+            .onClick(() => {
+              this.saveTheme(t);
+            })
+        }, (t: string) => t)
       }
       .width('100%')
 
@@ -1931,6 +1964,10 @@ struct Index {
     hooks.onTtsState = (speaking: boolean, hint: string) => {
       this.speaking = speaking;
       this.speechHint = hint;
+      if (!speaking) {
+        // 读完/被打断 → 字幕消失
+        this.subtitle = '';
+      }
     };
     hooks.onAsrState = (listening: boolean, hint: string) => {
       this.listening = listening;
@@ -1989,6 +2026,7 @@ struct Index {
     if (!this.ttsOn) {
       return;
     }
+    this.subtitle = clean;
     this.tts.speak(clean).catch((e: Error) => {
       hilog.error(LOG_DOMAIN, LOG_TAG, 'tts speak rejected: %{public}s', e.message);
     });
@@ -2602,6 +2640,16 @@ struct Index {
    * 把当前状态推给桌面小组件。
    * 卡片在独立进程，只能通过沙箱文件 + updateForm 传递；失败不影响主流程。
    */
+  /** 刷新系统状态（电量/充电）。失败静默，不影响任何功能 */
+  private refreshSysInfo(): void {
+    try {
+      this.batteryPct = batteryInfo.batterySOC;
+      this.charging = batteryInfo.chargingStatus === batteryInfo.BatteryChargeState.ENABLE;
+    } catch (e) {
+      // 个别 ROM 上 batteryInfo 可能不可用，忽略
+    }
+  }
+
   private updateWidget(): void {
     try {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;

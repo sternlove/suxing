@@ -15,6 +15,17 @@ export const THEME_DARK: string = 'dark';
 /** 浅色主题标识（落 preferences 的值） */
 export const THEME_LIGHT: string = 'light';
 
+/**
+ * 皮肤扩展（借鉴 GDDXX-Jarvis 的多皮肤思路）：
+ * 每套只换配色，不碰 3D 模型与动画 —— 3D 层始终是深色全息场景。
+ */
+export const THEME_CYBER: string = 'cyber';
+export const THEME_AMBER: string = 'amber';
+export const THEME_MONO: string = 'mono';
+
+/** 全部可选主题，面板按这个顺序渲染按钮 */
+export const ALL_THEMES: string[] = [THEME_DARK, THEME_LIGHT, THEME_CYBER, THEME_AMBER, THEME_MONO];
+
 /** 一套主题的全部颜色槽位；页面只通过 paletteOf() 取用 */
 export interface Palette {
   /** 主题标识：THEME_DARK / THEME_LIGHT */
@@ -160,8 +171,131 @@ const LIGHT: Palette = {
 };
 
 /** 主题标识 → 颜色表；未知值一律按深色（默认主题）处理 */
+/** 赛博紫：深底 + 紫粉霓虹，比默认深色更有"电子感" */
+const CYBER: Palette = {
+  theme: THEME_CYBER,
+  label: '赛博紫',
+  isDark: true,
+  bgRoot: '#12101C',
+  bgHeader: '#E61E1A2E',
+  bgStatus: '#E6181428',
+  bgList: '#99141020',
+  bgInputBar: '#F21E1A2E',
+  bgInput: '#2A2440',
+  bgPanel: '#1E1A2E',
+  bubbleUser: '#8B5CF6',
+  bubbleUserText: '#FFFFFF',
+  bubbleBot: '#B3221E33',
+  bubbleBotText: '#F0E8FF',
+  text: '#F0E8FF',
+  textDim: '#A99CC8',
+  textMuted: '#8878A8',
+  placeholder: '#8878A8',
+  textOff: '#5E5278',
+  primary: '#8B5CF6',
+  danger: '#E53935',
+  ok: '#69F0AE',
+  okBg: '#2E7D32',
+  warn: '#FFD180',
+  err: '#FF8A80',
+  errSoft: '#FF8A65',
+  info: '#64B5F6',
+  accent2: '#F06292',
+  btnBg: '#332D4A',
+  border: '#3D3560',
+  scrim: '#99000000',
+  veil3d: '#00000000',
+  logText: '#9AD0FF'
+};
+
+/** 琥珀：暖橙底调，夜里看着不刺眼 */
+const AMBER: Palette = {
+  theme: THEME_AMBER,
+  label: '琥珀',
+  isDark: true,
+  bgRoot: '#1A1410',
+  bgHeader: '#E6261E16',
+  bgStatus: '#E6201A12',
+  bgList: '#991A1410',
+  bgInputBar: '#F2261E16',
+  bgInput: '#3A2E22',
+  bgPanel: '#261E16',
+  bubbleUser: '#D97706',
+  bubbleUserText: '#FFFFFF',
+  bubbleBot: '#B3302718',
+  bubbleBotText: '#FFF3E0',
+  text: '#FFF3E0',
+  textDim: '#C4A882',
+  textMuted: '#9C8562',
+  placeholder: '#9C8562',
+  textOff: '#6B5A42',
+  primary: '#D97706',
+  danger: '#C62828',
+  ok: '#AED581',
+  okBg: '#33691E',
+  warn: '#FFCC80',
+  err: '#FF8A65',
+  errSoft: '#FFAB91',
+  info: '#FFB74D',
+  accent2: '#FFE082',
+  btnBg: '#3D3126',
+  border: '#4A3B2C',
+  scrim: '#99000000',
+  veil3d: '#00000000',
+  logText: '#FFCC80'
+};
+
+/** 极简：近白底 + 单色强调，信息密度最高 */
+const MONO: Palette = {
+  theme: THEME_MONO,
+  label: '极简',
+  isDark: false,
+  bgRoot: '#FAFAFA',
+  bgHeader: '#F7FFFFFF',
+  bgStatus: '#F2F5F5F5',
+  bgList: '#FFFFFFFF',
+  bgInputBar: '#F7FFFFFF',
+  bgInput: '#EFEFEF',
+  bgPanel: '#FFFFFF',
+  bubbleUser: '#212121',
+  bubbleUserText: '#FFFFFF',
+  bubbleBot: '#F0F0F0',
+  bubbleBotText: '#212121',
+  text: '#1A1A1A',
+  textDim: '#5F5F5F',
+  textMuted: '#8A8A8A',
+  placeholder: '#9E9E9E',
+  textOff: '#BDBDBD',
+  primary: '#212121',
+  danger: '#C62828',
+  ok: '#2E7D32',
+  okBg: '#E8F5E9',
+  warn: '#EF6C00',
+  err: '#C62828',
+  errSoft: '#E57373',
+  info: '#1565C0',
+  accent2: '#616161',
+  btnBg: '#EDEDED',
+  border: '#E0E0E0',
+  scrim: '#66000000',
+  veil3d: '#F2FFFFFF',
+  logText: '#1565C0'
+};
+
 export function paletteOf(theme: string): Palette {
-  return theme === THEME_LIGHT ? LIGHT : DARK;
+  if (theme === THEME_LIGHT) {
+    return LIGHT;
+  }
+  if (theme === THEME_CYBER) {
+    return CYBER;
+  }
+  if (theme === THEME_AMBER) {
+    return AMBER;
+  }
+  if (theme === THEME_MONO) {
+    return MONO;
+  }
+  return DARK;
 }
 
 /** 面板上显示的名字 */
