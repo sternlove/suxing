@@ -96,6 +96,7 @@ import { clipboardSkill } from '../skills/ClipboardSkill';
 import { makeSkillsSkill } from '../skills/SkillsSkill';
 import { systemSkill } from '../skills/SystemSkill';
 import { McpClient } from '../common/McpClient';
+import { DocSkill, DocSkillStore } from '../common/DocSkill';
 import { makeMcpSkills } from '../skills/McpSkillBridge';
 import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
@@ -315,11 +316,14 @@ struct Index {
   private pref: preferences.Preferences | undefined = undefined;
   private modelPath: string = '';
   /** 当前主题标识（THEME_DARK / THEME_LIGHT）：@State themeDark 只是它的镜像，两者一起改 */
-  private theme: string = THEME_DARK;
+  @State private theme: string = THEME_DARK;
   /** 聊天记忆（SQLite）与「最近 N 轮」的内存副本，两者同步维护 */
   private mem: ChatMemory = new ChatMemory();
   /** 技能注册表：动作型请求走这里，不必再往 Index 里塞方法（借鉴 Jarvis plugins） */
   private skills: SkillRegistry = new SkillRegistry();
+  /** 文档技能：沙箱里 skills/<id>/SKILL.md，命中后拼进 prompt（借鉴 homerail） */
+  private docSkills: DocSkillStore = new DocSkillStore();
+  @State docSkillCount: number = 0;
   /** 语义检索是否启用（embedding 模型加载成功） */
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
@@ -362,6 +366,14 @@ struct Index {
     this.skills.register(clipboardSkill);
     this.skills.register(makeSkillsSkill(() => this.skills.names()));
     this.skills.register(systemSkill);
+    // 文档技能：扫沙箱里的 SKILL.md，不用编译就能扩能力
+    try {
+      const dctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      this.docSkills.ensureSample(dctx.filesDir);
+      this.docSkillCount = this.docSkills.scan(dctx.filesDir);
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'docskill scan skipped: %{public}s', (e as Error).message);
+    }
     this.initSettings().catch((e: Error) => {
       this.status = '读取配置失败：' + e.message;
     });
@@ -966,19 +978,42 @@ struct Index {
           .fontSize(13)
           .fontColor(this.pal().textDim)
           .layoutWeight(1)
-        // 皮肤列表：主题只换配色，3D 层不参与（借鉴 Jarvis 多皮肤思路）
-        ForEach(ALL_THEMES, (t: string) => {
-          Button(paletteOf(t).label)
-            .height(30)
-            .fontSize(12)
-            .borderRadius(15)
-            .margin({ left: 4 })
-            .backgroundColor(this.theme === t ? this.pal().primary : this.pal().btnBg)
-            .fontColor(this.theme === t ? this.pal().bubbleUserText : this.pal().text)
+        // 皮肤面板：照 Jarvis 的做法 —— 网格布局 + 每格色块预览 + 选中态边框
+        // （它的实现是 #skinPick 三列 grid，每格是预览缩略图而不是纯文字按钮）
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+          ForEach(ALL_THEMES, (t: string) => {
+            Column({ space: 4 }) {
+              // 预览：上半是页面底色，下半是主色条，一眼看出这套皮肤长什么样
+              Row()
+                .width('100%')
+                .height(22)
+                .backgroundColor(paletteOf(t).bgRoot)
+                .borderRadius({ topLeft: 5, topRight: 5 })
+              Row()
+                .width('100%')
+                .height(9)
+                .backgroundColor(paletteOf(t).primary)
+                .borderRadius({ bottomLeft: 5, bottomRight: 5 })
+              Text(paletteOf(t).label)
+                .fontSize(10)
+                .fontColor(this.theme === t ? this.pal().primary : this.pal().textDim)
+                .fontWeight(this.theme === t ? FontWeight.Bold : FontWeight.Normal)
+            }
+            .width(62)
+            .padding(4)
+            .margin({ right: 8, bottom: 8 })
+            .borderRadius(7)
+            .backgroundColor(this.theme === t ? this.pal().btnBg : Color.Transparent)
+            .border({
+              width: this.theme === t ? 2 : 1,
+              color: this.theme === t ? this.pal().primary : this.pal().border
+            })
             .onClick(() => {
               this.saveTheme(t);
             })
-        }, (t: string) => t)
+          }, (t: string) => t)
+        }
+        .width('100%')
       }
       .width('100%')
 
@@ -1347,8 +1382,9 @@ struct Index {
    * veil3d 浅纱把它压成背景水印，只切 UI 层的颜色。
    */
   private async saveTheme(theme: string): Promise<void> {
-    this.theme = theme === THEME_LIGHT ? THEME_LIGHT : THEME_DARK;
-    this.themeDark = this.theme === THEME_DARK;
+    // 之前写成三元只认 LIGHT，导致 cyber/amber/mono 全被吞成 DARK（点赛博紫等于点深色）
+    this.theme = theme;
+    this.themeDark = paletteOf(theme).isDark;
     hilog.info(LOG_DOMAIN, LOG_TAG, 'theme set %{public}s', this.theme);
     try {
       let pref: preferences.Preferences;
@@ -2323,8 +2359,9 @@ struct Index {
       const mp: preferences.ValueType = pref.getSync(KEY_MODEL_PATH, '');
       this.modelPath = typeof mp === 'string' ? mp : '';
       const th: preferences.ValueType = pref.getSync(KEY_THEME, THEME_DARK);
-      this.theme = (typeof th === 'string' && th === THEME_LIGHT) ? THEME_LIGHT : THEME_DARK;
-      this.themeDark = this.theme === THEME_DARK;
+      // 同上：不能只认 LIGHT，否则重启后 cyber/amber/mono 会被还原成 DARK
+      this.theme = typeof th === 'string' && th !== '' ? th : THEME_DARK;
+      this.themeDark = paletteOf(this.theme).isDark;
       hilog.info(LOG_DOMAIN, LOG_TAG, 'theme loaded %{public}s', this.theme);
       this.keyInput = this.cloudKey;
       this.modelInput = this.cloudModel;
@@ -3152,7 +3189,18 @@ struct Index {
   private buildChatMl(userText: string): string {
     const turns: ChatTurn[] = recentTurns(this.history, HISTORY_ROUNDS);
     // system 由人格内核统一拼：底线人格 + 事实 + 偏好(≤3) + 情绪，总长封顶 PERSONA_MAX_CHARS
-    const sys: string = this.currentSystemPrompt('chatml');
+    let sys: string = this.currentSystemPrompt('chatml');
+    // 文档技能注入（homerail 的 SKILL.md 思路）：命中就把它当成「操作说明书」塞进上下文
+    const docHits: DocSkill[] = this.docSkills.match(userText);
+    if (docHits.length > 0) {
+      const block: string = this.docSkills.buildBlock(docHits);
+      if (block !== '') {
+        sys = sys + '\n' + block;
+        hilog.info(LOG_DOMAIN, LOG_TAG,
+          'docskill inject id=[%{public}s] blockChars=%{public}d totalSys=%{public}d',
+          docHits[0].id, block.length, sys.length);
+      }
+    }
     const pack: PromptPack = buildLocalPromptPack(sys, turns, userText, LOCAL_PROMPT_CHARS, this.ragLines);
     const prompt: string = pack.prompt;
     const kept: number = prompt.split('<|im_start|>').length - 1;
