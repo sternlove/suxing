@@ -40,6 +40,8 @@
 | **主动搭话** | 静默 10 分钟主动开口，每小时上限 2 次，23:00-07:00 静默，不重复最近 3 句 |
 | **对话指令** | 说「用 QQ 发给李四：文件收到了」→ 解析出目标应用/收件人/内容 → 唤起系统分享 |
 | **剪贴板** | 说「看看我的报错」→ 读取剪贴板内容分析（2000 字截断） |
+| **技能框架** | 动作型请求走可插拔技能，新增能力不用改对话主流程 |
+| **MCP 客户端** | 接入外部 MCP server，工具自动变成技能 |
 
 ---
 
@@ -68,6 +70,7 @@ graph TD
     UI --> Proactive["Proactive<br/>主动搭话闸门"]
     UI --> Speech["Speech<br/>TTS · 离线 ASR"]
     UI --> Proto["TwinProto<br/>指令解析"]
+    UI --> Skills["SkillRegistry<br/>技能注册表"]
     UI --> Avatar["Avatar3D<br/>全屏 3D 场景"]
     UI --> React["AvatarReaction<br/>语义动作映射"]
 
@@ -76,6 +79,11 @@ graph TD
     Proto --> Share["WechatShare<br/>系统分享"]
     Avatar --> Kit["ModelKit<br/>双模型配置"]
     Avatar --> Viseme["Viseme<br/>口型驱动"]
+
+    Skills --> Builtin["skills/ 内置技能<br/>剪贴板 · 系统状态 · 技能清单"]
+    Skills --> Bridge["McpSkillBridge<br/>MCP 工具 → 技能"]
+    Bridge --> Mcp["McpClient<br/>JSON-RPC over HTTP"]
+    Mcp -. "JSON-RPC" .-> McpServer["外部 MCP Server"]
 
     Llama -. "NAPI" .-> Native["libllamaohos.so<br/>llama.cpp 交叉编译"]
     Cloud -. "HTTPS" .-> API["云端 API"]
@@ -175,6 +183,74 @@ libllama.so  libggml.so  libggml-base.so  libggml-cpu.so  libc++_shared.so
 
 ---
 
+## 扩展：加一个技能
+
+动作型请求（「看看剪贴板」这类）走技能系统，不用改 3200 行的 `Index.ets`。
+
+```ts
+// skills/MySkill.ets
+import { Skill, SkillEnv, SkillResult } from '../common/Skill';
+
+export const mySkill: Skill = {
+  id: 'my-skill',
+  name: '我的技能',
+  // 用户输入「包含」任一触发词就命中 —— 不要求精确匹配
+  triggers: ['我的触发器', '另一个说法'],
+  run: async (input: string, env: SkillEnv): Promise<SkillResult> => {
+    // env.filesDir  沙箱目录
+    // env.say(x)    往对话里追加一条
+    // env.status(x) 状态栏提示
+    return { handled: true, reply: '先生，做完了。' };
+  }
+};
+```
+
+在 `pages/Index.ets` 的 `aboutToAppear` 里注册一行：
+
+```ts
+this.skills.register(mySkill);
+```
+
+**执行顺序**（`send()` 内）：结构化指令 → 技能 → 聊天。技能抛异常时记 warn 并落回聊天，不会卡住对话。
+
+## 接入 MCP 工具
+
+苏兴是 MCP **Client**：连上外部 server 后，它的每个工具都会自动变成一个技能。
+
+```bash
+# 电脑上起测试 server（零依赖，只用标准库）
+python tools/mcp_test_server.py
+# → MCP test server on http://0.0.0.0:8765/mcp
+```
+
+手机上：复制 `http://<电脑局域网IP>:8765/mcp` → 打开苏兴 → **🤖 操控** → 「从剪贴板连接 MCP server」。
+
+连上后：
+
+```
+add {"a":3,"b":4}   → 调用 add 工具 → 7.0
+你会什么             → 技能清单里会出现这三个工具
+```
+
+**触发方式说明**：本地 1.7B 不支持 function calling，没法让它自己选工具。所以走「输入里出现工具名即触发」，参数取输入里的 JSON，没有 JSON 就把工具名之后的文字当单参数。等模型支持工具调用后，这里的 triggers 可以退化成纯 schema。
+
+## 借鉴与致谢
+
+技能框架与 MCP 支持的设计参考了 [shitoudaidi/GDDXX-Jarvis](https://github.com/shitoudaidi/GDDXX-Jarvis)（Windows 桌面贾维斯）的插件与工具接入思路。
+
+**代码未复制**：该项目是 GPL-3.0，苏兴是 MIT。GPL 有传染性，复制代码会迫使本项目改用 GPL。所有实现均为 ArkTS 重写。
+
+具体借鉴的四项体验改进：
+
+| 借鉴点 | 本项目实现 |
+|---|---|
+| 随时打断（barge-in） | 按下麦克风先停朗读，避免录到自己 |
+| 实时字幕 | 朗读时显示当前句，点击即停 |
+| 多套皮肤 | 深色/浅色/赛博紫/琥珀/极简（3D 层不参与） |
+| 系统状态 | 状态条显示电量与充电 |
+| 插件系统 | `common/Skill.ets` + `skills/` |
+| MCP 工具接入 | `common/McpClient.ets` + `skills/McpSkillBridge.ets` |
+
 ## 项目结构
 
 ```
@@ -194,7 +270,18 @@ entry/src/main/ets/
 │   ├── Proactive.ets            主动搭话（闸门/模板/冷却）
 │   ├── Speech.ets               TTS + 离线 ASR
 │   ├── TwinProto.ets            对话指令解析
+│   ├── Skill.ets                技能接口 + 注册表
+│   ├── McpClient.ets            MCP 客户端（JSON-RPC over HTTP）
 │   └── WechatShare.ets          系统分享
+├── skills/                      可插拔技能
+│   ├── ClipboardSkill.ets       读剪贴板
+│   ├── SystemSkill.ets          时间与电量
+│   ├── SkillsSkill.ets          元技能：说出自己会什么
+│   └── McpSkillBridge.ets       MCP 工具 → 技能
+├── card/                        桌面小组件
+├── formability/                 小组件生命周期
+├── tools/                       开发辅助
+│   └── mcp_test_server.py       MCP 测试服务器（零依赖）
 ├── cpp/                         NAPI 桥接（napi_init.cpp + CMakeLists）
 └── resources/rawfile/           3D 模型（自备）
 ```
