@@ -27,6 +27,7 @@ import { preferences } from '@kit.ArkData';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { batteryInfo } from '@kit.BasicServicesKit';
 import { request } from '@kit.BasicServicesKit';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
 import { AiRouter, RouteMode } from '../common/AiRouter';
@@ -97,6 +98,8 @@ import { makeSkillsSkill } from '../skills/SkillsSkill';
 import { systemSkill } from '../skills/SystemSkill';
 import { McpClient } from '../common/McpClient';
 import { DocSkill, DocSkillStore } from '../common/DocSkill';
+import { ChatArchive, ChatStyle } from '../common/ChatArchive';
+import { SessionPersona } from '../common/Memory';
 import { makeMcpSkills } from '../skills/McpSkillBridge';
 import { NotifyCenter } from '../common/Notify';
 import { DEFAULT_MODEL_KIND, KIND_ANIME, KIND_REALISTIC, profileOf } from '../common/ModelKit';
@@ -324,6 +327,10 @@ struct Index {
   /** 文档技能：沙箱里 skills/<id>/SKILL.md，命中后拼进 prompt（借鉴 homerail） */
   private docSkills: DocSkillStore = new DocSkillStore();
   @State docSkillCount: number = 0;
+  /** 当前会话的人设：导入聊天记录后非空，为空则用默认苏兴人格 */
+  @State personaStyle: string = '';
+  @State personaName: string = '';
+  @State personaAvatar: string = '';
   /** 语义检索是否启用（embedding 模型加载成功） */
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
@@ -478,6 +485,15 @@ struct Index {
       Column() {
         Row() {
           // 💬 当前会话就是多会话入口：点开是会话列表（新建 / 改名 / 删除 / 切换）
+          // 导入过聊天记录的会话会带一个头像，一眼看出当前在跟谁的人格对话
+          if (this.personaAvatar !== '') {
+            Image('file://' + this.personaAvatar)
+              .width(26)
+              .height(26)
+              .borderRadius(13)
+              .margin({ left: 6, right: 2 })
+              .objectFit(ImageFit.Cover)
+          }
           Text('≡ ' + this.curTitle)
             .fontSize(12)
             .fontColor(this.pal().text)
@@ -1041,6 +1057,24 @@ struct Index {
         Button('从剪贴板连接 MCP server')
           .onClick(() => {
             this.connectMcpFromClipboard();
+          })
+          .margin({ top: 4 })
+
+        // 会话级人设：导入 PDF 聊天记录 → 学那个人说话
+        Text(this.personaStyle === '' ? '🎭 人设：默认苏兴（未导入记录）' : ('🎭 人设：已学习 ' + this.personaStyle.substring(0, 18) + '…'))
+          .fontSize(12)
+          .fontColor(this.pal().textDim)
+          .width('100%')
+          .margin({ top: 8 })
+        Button('🖼️ 设置会话头像')
+          .onClick(() => {
+            this.importAvatar();
+          })
+          .margin({ top: 4 })
+
+        Button('📄 导入聊天记录学习语气（PDF）')
+          .onClick(() => {
+            this.importChatArchive();
           })
           .margin({ top: 4 })
 
@@ -1671,6 +1705,20 @@ struct Index {
   }
 
   /** 切会话：消息列表、上下文、检索窗口一起切到该会话 */
+  /** 读当前会话的人设，刷到 UI 状态（切会话/启动时都要调） */
+  private async loadPersonaForSession(): Promise<void> {
+    try {
+      const p: SessionPersona = await this.mem.getSessionPersona(this.mem.currentSessionId());
+      this.personaName = p.name;
+      this.personaStyle = p.style;
+      this.personaAvatar = p.avatar;
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'persona session loaded sid=%{public}d styleChars=%{public}d',
+        this.mem.currentSessionId(), p.style.length);
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'loadPersonaForSession failed: %{public}s', (e as Error).message);
+    }
+  }
+
   private async switchSession(id: number): Promise<void> {
     if (this.generating) {
       promptAction.showToast({ message: '正在生成，先停止再切会话', duration: 2000 });
@@ -1689,6 +1737,8 @@ struct Index {
     this.curSessionId = id;
     await this.refreshSessions();
     await this.loadSessionIntoUi('switch');
+    // 人设跟着会话走：A 会话学的是甲，切到 B 就该回到 B 自己的人格
+    await this.loadPersonaForSession();
     this.showSessions = false;
     hilog.info(LOG_DOMAIN, LOG_TAG, 'session switched id=%{public}d title=[%{public}s] lines=%{public}d',
       id, this.curTitle, this.lines.length);
@@ -2756,6 +2806,93 @@ struct Index {
     }
   }
 
+  /**
+   * 导入聊天记录 PDF，分析说话风格并绑定到**当前会话**。
+   * 不同会话导不同记录 = 不同人格；不导就是默认苏兴。
+   */
+  private async importChatArchive(): Promise<void> {
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      options.fileSuffixFilters = ['PDF 聊天记录|.pdf'];
+      const uris: string[] = await docPicker.select(options);
+      if (uris === undefined || uris.length === 0) {
+        return;
+      }
+      this.status = '解析聊天记录…';
+      await this.nextFrame();
+      const dest: string = await this.stageModel(ctx, uris[0]);
+      if (dest === '') {
+        return;
+      }
+      const style: ChatStyle = ChatArchive.fromPdf(dest);
+      if (style.samples === 0) {
+        this.status = '⚠ 没从 PDF 里解析出对话内容（检查是否带「名字：内容」前缀）';
+        promptAction.showToast({ message: '没解析出对话内容', duration: 2500 });
+        return;
+      }
+      const sid: number = this.mem.currentSessionId();
+      const ok: boolean = await this.mem.setSessionPersona(sid, this.personaName, style.summary, this.personaAvatar);
+      if (ok) {
+        this.personaStyle = style.summary;
+        this.status = '✅ 已学习 ' + style.samples + ' 句风格';
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'archive imported sid=%{public}d samples=%{public}d',
+          sid, style.samples);
+        promptAction.showToast({ message: '✅ 已学习 ' + style.samples + ' 句', duration: 2000 });
+      } else {
+        this.status = '写入人设失败';
+      }
+    } catch (e) {
+      const err: Error = e as Error;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'archive import failed: %{public}s', err.message);
+      this.status = '导入失败：' + err.message;
+    }
+  }
+
+  /**
+   * 选一张图作为当前会话的头像（用户自己传）。
+   * 图片复制进沙箱再存路径：相册 URI 的权限是临时的，重启后原 URI 会失效。
+   */
+  private async importAvatar(): Promise<void> {
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const picker2: photoAccessHelper.PhotoViewPicker = new photoAccessHelper.PhotoViewPicker();
+      const opts: photoAccessHelper.PhotoSelectOptions = new photoAccessHelper.PhotoSelectOptions();
+      opts.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+      opts.maxSelectNumber = 1;
+      const res: photoAccessHelper.PhotoSelectResult = await picker2.select(opts);
+      if (res.photoUris === undefined || res.photoUris.length === 0) {
+        return;
+      }
+      const srcUri: string = res.photoUris[0];
+      const sid: number = this.mem.currentSessionId();
+      const dir: string = ctx.filesDir + '/avatars';
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir);
+      }
+      const dest: string = dir + '/session_' + sid + '.img';
+      const src: fs.File = fs.openSync(srcUri, fs.OpenMode.READ_ONLY);
+      try {
+        fs.copyFileSync(src.fd, dest);
+      } finally {
+        fs.closeSync(src);
+      }
+      const ok: boolean = await this.mem.setSessionPersona(sid, this.personaName, this.personaStyle, dest);
+      if (ok) {
+        this.personaAvatar = dest;
+        this.status = '✅ 头像已设置';
+        promptAction.showToast({ message: '✅ 头像已设置', duration: 1500 });
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'avatar set sid=%{public}d dest=%{public}s', sid, dest);
+      }
+    } catch (e) {
+      const err: Error = e as Error;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'avatar import failed: %{public}s', err.message);
+      this.status = '头像设置失败：' + err.message;
+    }
+  }
+
   private updateWidget(): void {
     try {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
@@ -3190,18 +3327,28 @@ struct Index {
     const turns: ChatTurn[] = recentTurns(this.history, HISTORY_ROUNDS);
     // system 由人格内核统一拼：底线人格 + 事实 + 偏好(≤3) + 情绪，总长封顶 PERSONA_MAX_CHARS
     let sys: string = this.currentSystemPrompt('chatml');
-    // 文档技能注入（homerail 的 SKILL.md 思路）：命中就把它当成「操作说明书」塞进上下文
+    // 会话级人设：导入过聊天记录就模仿那个人的说话习惯
+    if (this.personaStyle !== '') {
+      const who: string = this.personaName === '' ? '这个人' : this.personaName;
+      sys = sys + '\n你现在要模仿' + who + '的说话方式，下面是他/她的习惯：\n' + this.personaStyle
+        + '\n不要说自己是 AI，不要解释，像他/她那样直接说话。';
+    }
+    // 文档技能（homerail 的 SKILL.md 思路）：
+    //   system 里放「技能规则」，user 里放「现在就做这件事」——
+    //   只放 system 时 1.7B 会当成陈述句复述（实测回「先生，今天天气不错。」）。
     const docHits: DocSkill[] = this.docSkills.match(userText);
+    let chatUserText: string = userText;
     if (docHits.length > 0) {
-      const block: string = this.docSkills.buildBlock(docHits);
+      const block: string = this.docSkills.buildBlock(docHits, userText);
       if (block !== '') {
         sys = sys + '\n' + block;
-        hilog.info(LOG_DOMAIN, LOG_TAG,
-          'docskill inject id=[%{public}s] blockChars=%{public}d totalSys=%{public}d',
-          docHits[0].id, block.length, sys.length);
       }
+      chatUserText = this.docSkills.buildUserPrompt(docHits, userText);
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'docskill inject id=[%{public}s] blockChars=%{public}d sys=%{public}d user=[%{public}s]',
+        docHits[0].id, block.length, sys.length, chatUserText.substring(0, 50));
     }
-    const pack: PromptPack = buildLocalPromptPack(sys, turns, userText, LOCAL_PROMPT_CHARS, this.ragLines);
+    const pack: PromptPack = buildLocalPromptPack(sys, turns, chatUserText, LOCAL_PROMPT_CHARS, this.ragLines);
     const prompt: string = pack.prompt;
     const kept: number = prompt.split('<|im_start|>').length - 1;
     hilog.info(LOG_DOMAIN, LOG_TAG,

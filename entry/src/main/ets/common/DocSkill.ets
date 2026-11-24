@@ -238,22 +238,83 @@ export class DocSkillStore {
     return scored.slice(0, MAX_INJECT);
   }
 
-  /** 把命中技能拼成一段 prompt 片段；无命中返回空串 */
-  buildBlock(hits: DocSkill[]): string {
+  /**
+   * 把技能要求改写进 **user 消息**。
+   *
+   * 为什么不能只放 system：1.7B 对 system 里的长指令不敏感，实测把
+   * 「翻译今天天气不错」当成陈述句复述（回了「先生，今天天气不错。」）。
+   * user 消息离生成位置最近，祈使句放这里命中率高得多。
+   * system 里的技能正文仍然保留（双保险），但执行指令以 user 这条为准。
+   */
+  buildUserPrompt(hits: DocSkill[], userInput: string): string {
+    if (hits.length === 0) {
+      return userInput;
+    }
+    const s0: DocSkill = hits[0];
+    let content: string = userInput.trim();
+    const name: string = s0.name;
+    if (name !== '' && content.startsWith(name)) {
+      content = content.substring(name.length).trim();
+    }
+    const lead: string[] = ['请用', '帮我', '麻烦', '用'];
+    for (let i = 0; i < lead.length; i++) {
+      if (content.startsWith(lead[i])) {
+        content = content.substring(lead[i].length).trim();
+        if (name !== '' && content.startsWith(name)) {
+          content = content.substring(name.length).trim();
+        }
+        break;
+      }
+    }
+    if (content === '') {
+      content = userInput.trim();
+    }
+    // 只把「做什么」写进 user；具体规则仍在 system 里
+    return '按「' + name + '」的要求处理下面这段内容，直接给结果，不要重复原文也不要解释：\n' + content;
+  }
+
+  /**
+   * 拼成 prompt 片段。
+   *
+   * 措辞很关键：第一版写的是「以下是你掌握的操作技能，需要时照着做」——
+   * 那是**描述**，1.7B 读完不知道该不该现在做，实测不会执行（日志能证明注入成功但没照做）。
+   * 改成**祈使句 + 明确告知要处理的内容**，并把技能名从内容里剥掉
+   * （用户说「翻译今天天气不错」，剥掉「翻译」后模型只需处理「今天天气不错」，负担更小）。
+   */
+  buildBlock(hits: DocSkill[], userInput: string): string {
     if (hits.length === 0) {
       return '';
     }
-    const parts: string[] = [];
-    for (let i = 0; i < hits.length; i++) {
-      const s: DocSkill = hits[i];
-      let body: string = s.body;
-      let cut: boolean = false;
-      if (body.length > BODY_MAX_CHARS) {
-        body = body.substring(0, BODY_MAX_CHARS);
-        cut = true;
-      }
-      parts.push('【技能：' + s.name + '】\n' + body + (cut ? '\n…（已截断）' : ''));
+    const s0: DocSkill = hits[0];
+    let body: string = s0.body;
+    let cut: boolean = false;
+    if (body.length > BODY_MAX_CHARS) {
+      body = body.substring(0, BODY_MAX_CHARS);
+      cut = true;
     }
-    return '以下是你掌握的操作技能，需要时照着做：\n' + parts.join('\n\n');
+    let content: string = userInput.trim();
+    // 剥掉开头的技能名或「用/请/帮我」这类前缀，剩下的才是要处理的内容
+    const name: string = s0.name;
+    if (name !== '' && content.startsWith(name)) {
+      content = content.substring(name.length).trim();
+    }
+    const lead: string[] = ['请用', '帮我', '麻烦', '用', '帮我用'];
+    for (let i = 0; i < lead.length; i++) {
+      if (content.startsWith(lead[i])) {
+        content = content.substring(lead[i].length).trim();
+        if (name !== '' && content.startsWith(name)) {
+          content = content.substring(name.length).trim();
+        }
+        break;
+      }
+    }
+    let block: string = '现在请立刻执行【' + s0.name + '】技能，不要解释你在做什么，直接给结果。\n';
+    block += '技能要求：\n' + body + (cut ? '\n…（已截断）' : '') + '\n';
+    if (content !== '') {
+      block += '要处理的内容：' + content;
+    } else {
+      block += '要处理的内容：见用户这句话。';
+    }
+    return block;
   }
 }

@@ -88,6 +88,9 @@ const SQL_INDEX_SESSION: string =
 const SQL_CREATE_SESSIONS: string = 'CREATE TABLE IF NOT EXISTS ' + TABLE_SESSIONS + ' ('
   + 'id INTEGER PRIMARY KEY AUTOINCREMENT, '
   + 'title TEXT NOT NULL, '
+  + 'persona_name TEXT NOT NULL DEFAULT \'\', '
+  + 'persona_style TEXT NOT NULL DEFAULT \'\', '
+  + 'avatar_path TEXT NOT NULL DEFAULT \'\', '
   + 'created_ts INTEGER NOT NULL, '
   + 'updated_ts INTEGER NOT NULL)';
 /**
@@ -96,6 +99,13 @@ const SQL_CREATE_SESSIONS: string = 'CREATE TABLE IF NOT EXISTS ' + TABLE_SESSIO
  */
 const SQL_MIGRATE_SESSION_COL: string =
   'ALTER TABLE ' + TABLE_NAME + ' ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0';
+
+/** 会话级人设：导入聊天记录后填 style，选了头像填 avatar */
+export interface SessionPersona {
+  name: string;
+  style: string;
+  avatar: string;
+}
 
 export class ChatMemory {
   private store: relationalStore.RdbStore | undefined = undefined;
@@ -170,6 +180,51 @@ export class ChatMemory {
     this.vecStore.put(msgId, sid, v).catch((e: Error) => {
       hilog.warn(MEM_DOMAIN, MEM_TAG, 'vector put failed msgId=%{public}d: %{public}s', msgId, e.message);
     });
+  }
+
+  /** 写入某会话的人设（名字 / 风格描述 / 头像路径）；空串表示恢复默认人格 */
+  async setSessionPersona(sid: number, name: string, style: string, avatar: string): Promise<boolean> {
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined || sid <= 0) {
+      return false;
+    }
+    try {
+      const args: Array<relationalStore.ValueType> = [name, style, avatar, sid];
+      await st.executeSql(
+        'UPDATE ' + TABLE_SESSIONS + ' SET persona_name = ?, persona_style = ?, avatar_path = ? WHERE id = ?',
+        args);
+      hilog.info(MEM_DOMAIN, MEM_TAG, 'session persona set sid=%{public}d name=[%{public}s] styleChars=%{public}d',
+        sid, name, style.length);
+      return true;
+    } catch (e) {
+      hilog.error(MEM_DOMAIN, MEM_TAG, 'setSessionPersona failed: %{public}s', (e as Error).message);
+      return false;
+    }
+  }
+
+  /** 读某会话的人设；没人设时三项都是空串 */
+  async getSessionPersona(sid: number): Promise<SessionPersona> {
+    const out: SessionPersona = { name: '', style: '', avatar: '' };
+    const st: relationalStore.RdbStore | undefined = this.store;
+    if (st === undefined || sid <= 0) {
+      return out;
+    }
+    try {
+      const rs: relationalStore.ResultSet = await st.querySql(
+        'SELECT persona_name, persona_style, avatar_path FROM ' + TABLE_SESSIONS + ' WHERE id = ?', [sid]);
+      try {
+        if (rs.goToFirstRow()) {
+          out.name = rs.getString(rs.getColumnIndex('persona_name')) ?? '';
+          out.style = rs.getString(rs.getColumnIndex('persona_style')) ?? '';
+          out.avatar = rs.getString(rs.getColumnIndex('avatar_path')) ?? '';
+        }
+      } finally {
+        rs.close();
+      }
+    } catch (e) {
+      hilog.warn(MEM_DOMAIN, MEM_TAG, 'getSessionPersona failed: %{public}s', (e as Error).message);
+    }
+    return out;
   }
 
   /** 当前会话 id（0 = 还没定下来） */
