@@ -98,7 +98,7 @@ import { makeSkillsSkill } from '../skills/SkillsSkill';
 import { systemSkill } from '../skills/SystemSkill';
 import { McpClient } from '../common/McpClient';
 import { DocSkill, DocSkillStore } from '../common/DocSkill';
-import { ChatArchive, ChatStyle } from '../common/ChatArchive';
+import { ChatArchive, ChatStyle, ArchiveResult } from '../common/ChatArchive';
 import { SessionPersona } from '../common/Memory';
 import { makeMcpSkills } from '../skills/McpSkillBridge';
 import { NotifyCenter } from '../common/Notify';
@@ -331,6 +331,8 @@ struct Index {
   @State personaStyle: string = '';
   @State personaName: string = '';
   @State personaAvatar: string = '';
+  /** 最近一次导入的解析报告（面板展示，让用户确认学到了谁、学到什么） */
+  @State archiveReport: string = '';
   /** 语义检索是否启用（embedding 模型加载成功） */
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
@@ -2827,20 +2829,27 @@ struct Index {
       if (dest === '') {
         return;
       }
-      const style: ChatStyle = ChatArchive.fromPdf(dest);
-      if (style.samples === 0) {
-        this.status = '⚠ 没从 PDF 里解析出对话内容（检查是否带「名字：内容」前缀）';
-        promptAction.showToast({ message: '没解析出对话内容', duration: 2500 });
+      const res: ArchiveResult = ChatArchive.fromPdf(dest);
+      if (res.style.samples === 0) {
+        this.archiveReport = '⚠ 没解析出对话内容。PDF 里需要有「名字：内容」这样的前缀，' +
+          '或者至少每行一句话（无前缀时按交替推断）。';
+        this.status = '⚠ 解析失败';
         return;
       }
       const sid: number = this.mem.currentSessionId();
-      const ok: boolean = await this.mem.setSessionPersona(sid, this.personaName, style.summary, this.personaAvatar);
+      const who: string = res.targetName === '' ? '（按交替推断）' : res.targetName;
+      const ok: boolean = await this.mem.setSessionPersona(sid, res.targetName, res.style.summary, this.personaAvatar);
       if (ok) {
-        this.personaStyle = style.summary;
-        this.status = '✅ 已学习 ' + style.samples + ' 句风格';
-        hilog.info(LOG_DOMAIN, LOG_TAG, 'archive imported sid=%{public}d samples=%{public}d',
-          sid, style.samples);
-        promptAction.showToast({ message: '✅ 已学习 ' + style.samples + ' 句', duration: 2000 });
+        this.personaStyle = res.style.summary;
+        this.personaName = res.targetName;
+        this.archiveReport = '✅ 解析模式：' + res.mode + '\n'
+          + '识别到：' + (res.counts.length > 0 ? res.counts.join('、') : '无') + '\n'
+          + '模仿对象：' + who + '（' + res.style.samples + ' 句）\n'
+          + '风格摘要：' + res.style.summary;
+        this.status = '✅ 已学习「' + who + '」的 ' + res.style.samples + ' 句风格';
+        hilog.info(LOG_DOMAIN, LOG_TAG,
+          'archive imported sid=%{public}d mode=%{public}s target=[%{public}s] samples=%{public}d',
+          sid, res.mode, res.targetName, res.style.samples);
       } else {
         this.status = '写入人设失败';
       }
@@ -2890,6 +2899,23 @@ struct Index {
       const err: Error = e as Error;
       hilog.error(LOG_DOMAIN, LOG_TAG, 'avatar import failed: %{public}s', err.message);
       this.status = '头像设置失败：' + err.message;
+    }
+  }
+
+  /** 恢复默认苏兴人格（清空当前会话的人设，头像保留由用户决定） */
+  private async clearPersona(): Promise<void> {
+    try {
+      const sid: number = this.mem.currentSessionId();
+      const ok: boolean = await this.mem.setSessionPersona(sid, '', '', this.personaAvatar);
+      if (ok) {
+        this.personaStyle = '';
+        this.personaName = '';
+        this.archiveReport = '已恢复默认苏兴人格（会话 ' + sid + '）';
+        this.status = '🎭 已恢复默认人格';
+        hilog.info(LOG_DOMAIN, LOG_TAG, 'persona cleared sid=%{public}d', sid);
+      }
+    } catch (e) {
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'clearPersona failed: %{public}s', (e as Error).message);
     }
   }
 

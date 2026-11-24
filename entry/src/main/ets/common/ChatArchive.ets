@@ -43,13 +43,30 @@ export interface ChatStyle {
   summary: string;
 }
 
+/** 一次导入的完整结果：解析报告 + 风格（面板要把它展示给用户） */
+export interface ArchiveResult {
+  /** labeled / bare / empty */
+  mode: string;
+  speakers: string[];
+  /** 「张三 42句」这种，直接给面板显示 */
+  counts: string[];
+  targetName: string;
+  style: ChatStyle;
+}
+
 export interface ParsedChat {
   /** 识别出的说话人（按句数降序） */
   speakers: string[];
+  /** 每个说话人的句数，面板要用它展示解析结果 */
+  counts: string[];
   /** 主对象的句子（要模仿的那个人的话） */
   target: string[];
   /** 用户自己的句子 */
   mine: string[];
+  /** 被选中当模仿对象的人名（空 = 没识别出说话人） */
+  targetName: string;
+  /** 解析模式：labeled=有名字前缀 timestamp=只有时间戳 bare=无标记 */
+  mode: string;
 }
 
 const PARTICLES: string[] = ['啊', '吧', '呢', '哈', '嘛', '呗', '咯', '呀', '哦', '噢', '唉', '诶'];
@@ -98,25 +115,41 @@ export class ChatArchive {
    * 支持「名字：内容」与「名字: 内容」（中英文冒号）；
    * 无前缀的行归到上一个说话人（处理后换行的情况）。
    */
+  /**
+   * 解析聊天记录，三种格式都试：
+   *   labeled    「名字：内容」——最可靠
+   *   timestamp  「[12:30] 名字：内容」或「名字 12:30」——微信/QQ 导出常见
+   *   bare       没有任何标记——按 A/B 交替猜测（可靠性最低，会标注出来）
+   */
   static parse(text: string): ParsedChat {
-    const out: ParsedChat = { speakers: [], target: [], mine: [] };
+    const out: ParsedChat = {
+      speakers: [], counts: [], target: [], mine: [], targetName: '', mode: 'bare'
+    };
     const lines: string[] = text.replace(/\r\n/g, '\n').split('\n');
     const bucket: Map<string, string[]> = new Map<string, string[]>();
     let cur: string = '';
+    let labeledHits: number = 0;
+
+    // [12:30] 或 12:30:15 这类时间戳前缀
+    const TS_HEAD: RegExp = /^\s*(?:\[?\d{1,2}[:：]\d{2}(?:[:：]\d{2})?\]?\s*)/;
 
     for (let i = 0; i < lines.length; i++) {
-      const raw: string = lines[i].trim();
+      let raw: string = lines[i].trim();
       if (raw === '') {
         continue;
       }
-      // 找第一个冒号（中文或英文），且冒号前不像时间戳（不含数字）
+      // 先剥掉时间戳前缀，剥完再找「名字：」
+      raw = raw.replace(TS_HEAD, '').trim();
+      if (raw === '') {
+        continue;
+      }
       const ci: number = raw.search(/[：:]/);
       let isHead: boolean = false;
       let who: string = '';
       let body: string = '';
       if (ci > 0 && ci <= 12) {
         const head: string = raw.substring(0, ci).trim();
-        // 排除「12:30」这种时间，和包含数字的行
+        // head 里不该有数字（排除残留时间），也不该太长
         if (!/[0-9]/.test(head) && head.length > 0) {
           isHead = true;
           who = head;
@@ -124,6 +157,7 @@ export class ChatArchive {
         }
       }
       if (isHead) {
+        labeledHits++;
         cur = who;
         if (!bucket.has(who)) {
           bucket.set(who, []);
@@ -139,22 +173,50 @@ export class ChatArchive {
       }
     }
 
-    // 说话人按句数降序
-    const entries: string[] = Array.from(bucket.keys());
-    entries.sort((a: string, b: string) => (bucket.get(b) as string[]).length - (bucket.get(a) as string[]).length);
-    out.speakers = entries;
-    if (entries.length === 0) {
-      // 没有任何前缀：整篇当目标语料
-      out.target = lines.filter((l: string) => l.trim() !== '').slice(0, MAX_LINES);
+    // 有名字前缀但只有 1 个说话人 → 可能是「自己一个人」或解析不全，仍然可用
+    if (labeledHits > 0 && bucket.size > 0) {
+      out.mode = 'labeled';
+      const entries: string[] = Array.from(bucket.keys());
+      entries.sort((a: string, b: string) =>
+        (bucket.get(b) as string[]).length - (bucket.get(a) as string[]).length);
+      out.speakers = entries;
+      for (let i = 0; i < entries.length; i++) {
+        out.counts.push(entries[i] + ' ' + (bucket.get(entries[i]) as string[]).length + '句');
+      }
+      // 只有一个说话人：把它的全部当模仿对象
+      const targetName: string = entries.length >= 2 ? entries[1] : entries[0];
+      const mineName: string = entries.length >= 2 ? entries[0] : '';
+      out.targetName = targetName;
+      out.target = (bucket.get(targetName) ?? []).slice(0, MAX_LINES);
+      out.mine = mineName === '' ? [] : (bucket.get(mineName) ?? []).slice(0, MAX_LINES);
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'archive parsed mode=labeled speakers=%{public}d target=[%{public}s] lines=%{public}d',
+        entries.length, targetName, out.target.length);
       return out;
     }
-    // 第一个说话人当「用户」（记录通常从自己开始），第二个当「要模仿的人」
-    const mineName: string = entries.length >= 2 ? entries[0] : '';
-    const targetName: string = entries.length >= 2 ? entries[1] : entries[0];
-    out.mine = (bucket.get(mineName) ?? []).slice(0, MAX_LINES);
-    out.target = (bucket.get(targetName) ?? []).slice(0, MAX_LINES);
-    hilog.info(LOG_DOMAIN, LOG_TAG, 'archive parsed speakers=%{public}d target=[%{public}s] lines=%{public}d',
-      entries.length, targetName, out.target.length);
+
+    // 没有名字前缀 → 按 A/B 交替猜（记录通常是「你一句我一句」）
+    const bare: string[] = lines.map((l: string) => l.trim())
+      .filter((l: string) => l !== '' && l.replace(TS_HEAD, '').trim() !== '')
+      .map((l: string) => l.replace(TS_HEAD, '').trim())
+      .slice(0, MAX_LINES);
+    out.mode = 'bare';
+    if (bare.length === 0) {
+      return out;
+    }
+    // 奇数位归「对方」：多数聊天记录是对方先说或交替，取奇数位覆盖面更大
+    for (let i = 0; i < bare.length; i++) {
+      if (i % 2 === 1) {
+        out.target.push(bare[i]);
+      } else {
+        out.mine.push(bare[i]);
+      }
+    }
+    out.targetName = '';
+    out.counts.push('无名字标记，按交替推断 ' + out.target.length + '句');
+    hilog.info(LOG_DOMAIN, LOG_TAG,
+      'archive parsed mode=bare guessed=%{public}d total=%{public}d',
+      out.target.length, bare.length);
     return out;
   }
 
@@ -297,13 +359,24 @@ export class ChatArchive {
     return out;
   }
 
-  /** 一步到位：文件路径 → 风格 */
-  static fromPdf(path: string): ChatStyle {
+  /** 一步到位：文件路径 → 解析报告 + 风格 */
+  static fromPdf(path: string): ArchiveResult {
     const text: string = ChatArchive.extractPdf(path);
     if (text === '') {
-      return ChatArchive.analyze([]);
+      return {
+        mode: 'empty', speakers: [], counts: [], targetName: '',
+        style: ChatArchive.analyze([])
+      };
     }
     const parsed: ParsedChat = ChatArchive.parse(text);
-    return ChatArchive.analyze(parsed.target);
+    const style: ChatStyle = ChatArchive.analyze(parsed.target);
+    const out: ArchiveResult = {
+      mode: parsed.mode,
+      speakers: parsed.speakers,
+      counts: parsed.counts,
+      targetName: parsed.targetName,
+      style: style
+    };
+    return out;
   }
 }
