@@ -3305,6 +3305,27 @@ struct Index {
       this.pendingIndex, this.lines.length, text.length);
 
     const cloudReady = this.cloudKey !== '';
+    // 技能任务强制云端：实测 1.7B 无论把指令放 system 还是 user 都不执行
+    // （三轮都回「先生，今天天气不错。」），这是模型能力边界，不是 prompt 问题。
+    // 本地只留闲聊，技能交给云端；断网时自然落回本地。
+    const skillHits: DocSkill[] = this.docSkills.match(text);
+    if (skillHits.length > 0) {
+      let onlineSkill: boolean = false;
+      if (cloudReady) {
+        onlineSkill = await AiRouter.isOnline();
+      }
+      if (onlineSkill) {
+        // buildBlock 的输出已含「技能要求 + 要处理的内容」，直接当 user 消息用
+        const skillUser: string = this.docSkills.buildBlock(skillHits, text);
+        hilog.info(LOG_DOMAIN, LOG_TAG,
+          'docskill force-cloud id=[%{public}s] userChars=%{public}d',
+          skillHits[0].id, skillUser.length);
+        this.modeLabel = '☁️ 云端（技能）';
+        await this.runCloud(skillUser);
+        return;
+      }
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'docskill cloud unavailable -> local fallback');
+    }
     const mode = await AiRouter.decide(cloudReady, this.llama.isReady());
     this.modeLabel = AiRouter.label(mode);
 
