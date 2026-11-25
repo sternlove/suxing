@@ -333,6 +333,11 @@ struct Index {
   @State personaAvatar: string = '';
   /** 最近一次导入的解析报告（面板展示，让用户确认学到了谁、学到什么） */
   @State archiveReport: string = '';
+  /** 云端连通性探测结果（面板显示，避免用户靠"快慢"猜 Key 有没有生效） */
+  @State cloudProbe: string = '';
+  /** 思考计时器句柄（-1 = 没在跑） */
+  private thinkTick: number = -1;
+  private thinkingDone: boolean = false;
   /** 语义检索是否启用（embedding 模型加载成功） */
   /** 实时字幕：朗读时把当前这句显示在屏幕上（借鉴 Jarvis subtitles），不依赖耳朵 */
   @State subtitle: string = '';
@@ -1611,6 +1616,8 @@ struct Index {
 
   /** 一轮收尾：这一问一答进内存 history，assistant 那行落库。流式中间态不进这里。 */
   private finishTurn(reply: string, modeName: string): void {
+    this.thinkingDone = true;
+    this.stopThinkingTimer();
     this.updateWidget();
     const ask: string = this.pendingUserText;
     this.pendingUserText = '';
@@ -2919,6 +2926,81 @@ struct Index {
     }
   }
 
+  /**
+   * 测一次云端连通：直接把 Key 和网络状态摊开给用户看。
+   *
+   * 为什么需要：路由是「云端优先」，但 cloudKey 为空时会静默走本地，
+   * 用户只会感觉"变慢了"，不知道是 Key 没生效。这个按钮把原因摆出来。
+   */
+  private async probeCloud(): Promise<void> {
+    this.cloudProbe = '检测中…';
+    try {
+      const hasKey: boolean = this.cloudKey !== '';
+      const online: boolean = await AiRouter.isOnline();
+      let msg: string = '';
+      if (!hasKey) {
+        msg = '❌ 没配 Key（所以一直走本地）';
+        this.cloudProbe = msg;
+        this.status = msg;
+        return;
+      }
+      if (!online) {
+        msg = '⚠ Key 已配置（' + this.cloudModel + '），但当前没有可用网络';
+        this.cloudProbe = msg;
+        this.status = msg;
+        return;
+      }
+      // 真发一次极短的请求，验证 Key 与模型名都能用
+      this.cloudProbe = 'Key 已配置，正在试连 ' + this.cloudModel + '…';
+      await this.nextFrame();
+      const probeMsgs: ChatMsg[] = [{ role: 'user', content: '只回复两个字：收到' }];
+      const got: string = await CloudApi.chat(this.cloudKey, this.cloudModel,
+        '你是连通性测试助手', probeMsgs);
+      const head: string = stripThink(got).trim().substring(0, 20);
+      if (head === '') {
+        this.cloudProbe = '⚠ 云端有响应但没有内容（Key 或模型名可能不对）';
+      } else {
+        this.cloudProbe = '✅ 云端可用（' + this.cloudModel + '）：' + head;
+      }
+      this.status = this.cloudProbe;
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'cloud probe ok model=%{public}s head=[%{public}s]',
+        this.cloudModel, head);
+    } catch (e) {
+      const err: Error = e as Error;
+      this.cloudProbe = '❌ 云端不可用：' + err.message;
+      this.status = this.cloudProbe;
+      hilog.warn(LOG_DOMAIN, LOG_TAG, 'cloud probe failed: %{public}s', err.message);
+    }
+  }
+
+  /**
+   * 首字延迟反馈。
+   *
+   * 本地 1.7B 预填充要 4~7 秒才开始吐字，这段时间界面上原来只有一个「…」，
+   * 用户不知道是在算还是卡死。这里按秒更新，首字一到立刻停表。
+   */
+  private startThinkingTimer(): void {
+    this.stopThinkingTimer();
+    const t0: number = Date.now();
+    this.thinkTick = setInterval(() => {
+      const sec: number = Math.floor((Date.now() - t0) / 1000);
+      const cur: string = (this.pendingIndex >= 0 && this.pendingIndex < this.lines.length)
+        ? this.lines[this.pendingIndex].text : '';
+      if (cur.startsWith('💭 思考中')) {
+        this.replacePending('💭 思考中… ' + sec + 's');
+      } else {
+        this.stopThinkingTimer();
+      }
+    }, 500);
+  }
+
+  private stopThinkingTimer(): void {
+    if (this.thinkTick >= 0) {
+      clearInterval(this.thinkTick);
+      this.thinkTick = -1;
+    }
+  }
+
   private updateWidget(): void {
     try {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
@@ -3217,7 +3299,8 @@ struct Index {
     await this.recall(ask);
 
     this.pendingIndex = this.lines.length;
-    this.lines.push({ role: 'assistant', text: '…' });
+    this.lines.push({ role: 'assistant', text: '💭 思考中…' });
+    this.startThinkingTimer();
     hilog.info(LOG_DOMAIN, LOG_TAG, 'send pendingIndex=%{public}d lines=%{public}d chars=%{public}d',
       this.pendingIndex, this.lines.length, text.length);
 
