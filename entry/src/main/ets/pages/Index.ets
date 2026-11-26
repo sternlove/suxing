@@ -99,6 +99,7 @@ import { systemSkill } from '../skills/SystemSkill';
 import { McpClient } from '../common/McpClient';
 import { DocSkill, DocSkillStore } from '../common/DocSkill';
 import { ChatArchive, ChatStyle, ArchiveResult } from '../common/ChatArchive';
+import { WebSearch, SearchItem, SearchOutcome } from '../common/WebSearch';
 import { SessionPersona } from '../common/Memory';
 import { makeMcpSkills } from '../skills/McpSkillBridge';
 import { NotifyCenter } from '../common/Notify';
@@ -335,6 +336,9 @@ struct Index {
   @State archiveReport: string = '';
   /** 云端连通性探测结果（面板显示，避免用户靠"快慢"猜 Key 有没有生效） */
   @State cloudProbe: string = '';
+  /** SearXNG 实例地址（形如 http://192.168.1.5:8080），空 = 未配置 */
+  @State searchUrl: string = '';
+  @State searchProbe: string = '';
   /** 思考计时器句柄（-1 = 没在跑） */
   private thinkTick: number = -1;
   private thinkingDone: boolean = false;
@@ -534,7 +538,7 @@ struct Index {
             .fontColor(this.pal().text)
             .margin({ left: 8 })
             .onClick(() => {
-              this.keyInput = this.cloudKey;
+      this.keyInput = this.cloudKey;
               this.modelInput = this.cloudModel;
               this.showCloud = true;
             })
@@ -2422,6 +2426,9 @@ struct Index {
       this.theme = typeof th === 'string' && th !== '' ? th : THEME_DARK;
       this.themeDark = paletteOf(this.theme).isDark;
       hilog.info(LOG_DOMAIN, LOG_TAG, 'theme loaded %{public}s', this.theme);
+      // SearXNG 地址（空 = 未配置联网检索）
+      const su: preferences.ValueType = pref.getSync('search_url', '');
+      this.searchUrl = typeof su === 'string' ? su : '';
       this.keyInput = this.cloudKey;
       this.modelInput = this.cloudModel;
     } catch (e) {
@@ -3001,6 +3008,78 @@ struct Index {
     }
   }
 
+  /**
+   * 从输入里识别联网检索意图，返回要搜的关键词（空串 = 不是检索请求）。
+   *
+   * 只用显式触发词，不做自动判断：1.7B 分不清「今天天气」是陈述还是要查天气，
+   * 自动判断会误触发、白花流量还把上下文搅乱。显式说「搜一下」最可靠。
+   */
+  private parseSearchIntent(input: string): string {
+    const t: string = input.trim();
+    const leads: string[] = ['搜一下', '搜搜', '搜索', '上网查', '联网查', '帮我查', '查一下最新的', '最新消息'];
+    for (let i = 0; i < leads.length; i++) {
+      const idx: number = t.indexOf(leads[i]);
+      if (idx >= 0) {
+        const rest: string = (t.substring(0, idx) + t.substring(idx + leads[i].length)).trim();
+        // 去掉「帮我」「请」这类前缀
+        return rest.replace(/^[，,。.！!？?\s]+/, '');
+      }
+    }
+    return '';
+  }
+
+  /** 联网检索并把结果交给云端总结（不是直接甩链接给用户） */
+  private async runSearch(keyword: string, originText: string): Promise<boolean> {
+    if (this.searchUrl === '') {
+      this.status = '⚠ 没配置搜索服务地址（🤖 操控 里填 SearXNG 地址）';
+      return false;
+    }
+    this.status = '🔍 检索中…';
+    await this.nextFrame();
+    const out: SearchOutcome = await WebSearch.query(this.searchUrl, keyword);
+    if (!out.ok) {
+      this.status = '搜索失败：' + out.message;
+      this.searchProbe = out.message;
+      return false;
+    }
+    this.searchProbe = out.message;
+    const block: string = WebSearch.buildBlock(out.items);
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'search inject keyword=[%{public}s] items=%{public}d',
+      keyword.substring(0, 30), out.items.length);
+    // 检索结果 + 用户原话一起给云端，让它总结成回答
+    if (this.cloudKey !== '' && await AiRouter.isOnline()) {
+      this.modeLabel = '🔍 检索 + ☁️ 云端';
+      await this.runCloud(block + '\n\n用户的问题是：' + originText);
+      return true;
+    }
+    // 没有云端：直接把检索结果摆出来（本地 1.7B 总结不了这些资料）
+    this.replacePending(WebSearch.buildPlain(out.items));
+    this.finishTurn(WebSearch.buildPlain(out.items), '检索');
+    return true;
+  }
+
+  /** 从剪贴板读 SearXNG 地址并保存（与 MCP 一致，避免给面板再加输入框） */
+  private async setSearchUrlFromClipboard(): Promise<void> {
+    try {
+      const data: pasteboard.PasteData = await pasteboard.getSystemPasteboard().getData();
+      const url: string = (data.getPrimaryText() ?? '').trim();
+      if (!url.startsWith('http')) {
+        this.status = '剪贴板不是 http(s) 地址';
+        return;
+      }
+      this.searchUrl = url;
+      const pref: preferences.Preferences | undefined = this.pref;
+      if (pref !== undefined) {
+        pref.putSync('search_url', url);
+        await pref.flush();
+      }
+      this.status = '✅ 搜索服务已设置';
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'search url set [%{public}s]', url.substring(0, 60));
+    } catch (e) {
+      this.status = '设置失败：' + (e as Error).message;
+    }
+  }
+
   private updateWidget(): void {
     try {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
@@ -3308,6 +3387,17 @@ struct Index {
     // 技能任务强制云端：实测 1.7B 无论把指令放 system 还是 user 都不执行
     // （三轮都回「先生，今天天气不错。」），这是模型能力边界，不是 prompt 问题。
     // 本地只留闲聊，技能交给云端；断网时自然落回本地。
+    // 联网检索：显式触发词优先，检索结果交给云端总结
+    const searchKw: string = this.parseSearchIntent(text);
+    if (searchKw !== '') {
+      const done: boolean = await this.runSearch(searchKw, text);
+      if (done) {
+        return;
+      }
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'search skipped kw=[%{public}s] -> normal chat',
+        searchKw.substring(0, 30));
+    }
+
     const skillHits: DocSkill[] = this.docSkills.match(text);
     if (skillHits.length > 0) {
       let onlineSkill: boolean = false;
