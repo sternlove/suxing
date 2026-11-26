@@ -37,7 +37,12 @@ export interface RagToken {
 }
 
 /** 注入 prompt 的片段条数上限（3 → 2 → 1 → 0 依次砍） */
-export const RAG_TOPK: number = 3;
+/**
+ * 检索注入条数。
+ * 3 → 5：用户反馈上下文关联太短，检索片段是最"耐磨"的记忆来源
+ * （不受轮数限制），多给两条比多给两轮更划算。
+ */
+export const RAG_TOPK: number = 5;
 /** 单条片段裁切字符数：一条长回复会把 n_ctx=2048 直接吃掉 */
 export const RAG_FRAG_CHARS: number = 48;
 /**

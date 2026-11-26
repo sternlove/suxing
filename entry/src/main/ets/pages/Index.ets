@@ -2452,7 +2452,7 @@ struct Index {
     this.modelPath = path;
     this.status = '加载上次的模型…';
     const t0: number = Date.now();
-    const ok: boolean = this.llama.loadModel(path);
+    const ok: boolean = this.llama.loadModel(path, { nCtx: 3072, nPredict: 768 });
     const ms: number = Date.now() - t0;
     this.localReady = ok;
     this.status = ok ? ('✅ 本地模型已加载：' + this.fileNameOf(path))
@@ -3160,7 +3160,7 @@ struct Index {
       await this.nextFrame();
       // loadModel 是同步 NAPI，阻塞 ArkTS 线程；先把状态刷到屏幕上再进来
       const t0: number = Date.now();
-      const ok: boolean = this.llama.loadModel(dest);
+      const ok: boolean = this.llama.loadModel(dest, { nCtx: 3072, nPredict: 768 });
       const ms: number = Date.now() - t0;
       hilog.info(LOG_DOMAIN, LOG_TAG,
         'import uri=%{public}s dest=%{public}s ok=%{public}s ms=%{public}d err=%{public}s',

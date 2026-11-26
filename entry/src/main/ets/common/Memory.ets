@@ -59,14 +59,21 @@ export const AUTO_TITLE_CHARS: number = 16;
 /** 启动时回填到消息列表的条数 */
 export const LOAD_LIMIT: number = 100;
 /** 送进模型的最近轮数（1 轮 = user + assistant） */
-export const HISTORY_ROUNDS: number = 6;
+export const HISTORY_ROUNDS: number = 10;
 /**
- * 本地模型 n_ctx=2048、native 缺省 nPredict=512，
- * 留给 prompt 的约 1536 token；中文按 1 token≈1.5 字保守折算 → 1500 字符。
+ * 本地上下文预算。
+ *
+ * 用户反馈「上下文关联太短」，排查发现不是被裁剪（实际只用 1005/1500），
+ * 而是轮数太少（6 轮）。提升到 10 轮，同时把 n_ctx 从 2048 提到 3072，
+ * 否则 10 轮 + 人格 + RAG 会超出窗口。
+ *
+ * 3072 token 预算里留 768 给生成 → prompt 可用约 2304 token；
+ * 中文按 1 token≈1.5 字保守折算 → 2400 字符。
  */
-export const LOCAL_PROMPT_CHARS: number = 1500;
+export const LOCAL_PROMPT_CHARS: number = 2400;
 /** 云端 messages 的字符预算：6 轮对话封顶，别把请求撑大 */
-export const CLOUD_PROMPT_CHARS: number = 4000;
+/** 云端 messages 字符预算：云模型窗口大得多，放宽到 6000（约 8~10 轮 + 检索片段） */
+export const CLOUD_PROMPT_CHARS: number = 6000;
 /**
  * RAG 候选集：只回捞最近这么多条参与 BM25，避免全表进内存。
  * 500 → 1500：500 条只覆盖最近几天，老记忆永远进不了检索窗口。
