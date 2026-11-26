@@ -3021,11 +3021,37 @@ struct Index {
       const idx: number = t.indexOf(leads[i]);
       if (idx >= 0) {
         const rest: string = (t.substring(0, idx) + t.substring(idx + leads[i].length)).trim();
-        // 去掉「帮我」「请」这类前缀
         return rest.replace(/^[，,。.！!？?\s]+/, '');
       }
     }
-    return '';
+
+    // 隐式触发：只对「本地模型必然不知道、且确实是在问」的情况自动检索。
+    // 起因：用户问「金价多少」没带触发词，走了本地，1.7B 只能瞎猜。
+    // 两个条件必须同时满足：①含实时信息词 ②是个疑问句，避免把陈述句也拿去搜。
+    const liveWords: string[] = ['金价', '油价', '股价', '汇率', '房价', '天气', '新闻', '比分',
+      '赛程', '最新版本', '发布了', '多少钱', '涨停', '价格'];
+    const askWords: string[] = ['多少', '吗', '呢', '怎么样', '如何', '几', '是不是', '有没有', '什么时候'];
+    let hasLive: boolean = false;
+    for (let i = 0; i < liveWords.length; i++) {
+      if (t.indexOf(liveWords[i]) >= 0) {
+        hasLive = true;
+        break;
+      }
+    }
+    if (!hasLive) {
+      return '';
+    }
+    let hasAsk: boolean = false;
+    for (let i = 0; i < askWords.length; i++) {
+      if (t.indexOf(askWords[i]) >= 0) {
+        hasAsk = true;
+        break;
+      }
+    }
+    if (!hasAsk) {
+      return '';
+    }
+    return t;
   }
 
   /** 联网检索并把结果交给云端总结（不是直接甩链接给用户） */
