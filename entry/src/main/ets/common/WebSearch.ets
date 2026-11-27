@@ -22,13 +22,20 @@ const LOG_TAG: string = 'CyberTwin';
 const MAX_RESULTS: number = 5;
 /** 每条摘要截断长度 */
 const SNIPPET_MAX: number = 160;
-const TIMEOUT_MS: number = 12000;
+/**
+ * 超时。12s → 9s：SearXNG 聚合多引擎本身就慢，但超过 9 秒还没回，
+ * 用户在界面上已经等了十几秒（首字 + 检索），体验崩了。
+ * 宁可拿部分结果，也不要让用户干等。
+ */
+const TIMEOUT_MS: number = 9000;
 
 export interface SearchItem {
   title: string;
   url: string;
   snippet: string;
   engine: string;
+  /** 发布时间（部分引擎提供，没有就是空串） */
+  published: string;
 }
 
 export interface SearchOutcome {
@@ -39,8 +46,12 @@ export interface SearchOutcome {
 }
 
 export class WebSearch {
-  /** 检索。baseUrl 形如 http://192.168.1.5:8080（不带 /search） */
-  static async query(baseUrl: string, keyword: string): Promise<SearchOutcome> {
+  /**
+   * 检索。baseUrl 形如 http://192.168.1.5:8080（不带 /search）。
+   * timeRange：'day' | 'week' | 'month' | ''，用来压掉陈旧结果
+   * （用户反馈「有时出来几天前的」，SearXNG 默认按相关性排序，不按时间）。
+   */
+  static async query(baseUrl: string, keyword: string, timeRange?: string): Promise<SearchOutcome> {
     const q: string = keyword.trim();
     if (q === '') {
       return { ok: false, message: '关键词为空', items: [] };
@@ -50,12 +61,17 @@ export class WebSearch {
     }
     const base: string = baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl;
     // 关键：format=json 必须带，否则实例返回 HTML
-    const url: string = base + '/search?q=' + encodeURIComponent(q)
+    const tr: string = timeRange ?? 'week';
+    let url: string = base + '/search?q=' + encodeURIComponent(q)
       + '&format=json&language=zh-CN&safesearch=1';
+    if (tr !== '') {
+      url += '&time_range=' + tr;
+    }
 
     const req: http.HttpRequest = http.createHttp();
     try {
-      hilog.info(LOG_DOMAIN, LOG_TAG, 'search -> %{public}s', url.substring(0, 120));
+      const t0: number = Date.now();
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'search -> %{public}s', url.substring(0, 140));
       const resp: http.HttpResponse = await req.request(url, {
         method: http.RequestMethod.GET,
         header: { 'Accept': 'application/json' },
@@ -89,15 +105,22 @@ export class WebSearch {
         if (sn.length > SNIPPET_MAX) {
           sn = sn.substring(0, SNIPPET_MAX) + '…';
         }
+        // publishedDate 只有部分引擎给（多为 ISO 时间），截到日期即可
+        let pub: string = (r.publishedDate as string) ?? '';
+        if (pub.length >= 10) {
+          pub = pub.substring(0, 10);
+        }
         items.push({
           title: title,
           url: link,
           snippet: sn,
-          engine: (r.engine as string) ?? ''
+          engine: (r.engine as string) ?? '',
+          published: pub
         });
       }
-      hilog.info(LOG_DOMAIN, LOG_TAG, 'search ok q=[%{public}s] total=%{public}d kept=%{public}d',
-        q.substring(0, 30), arr.length, items.length);
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'search ok q=[%{public}s] range=%{public}s total=%{public}d kept=%{public}d ms=%{public}d',
+        q.substring(0, 30), tr, arr.length, items.length, Date.now() - t0);
       return { ok: items.length > 0, message: items.length > 0 ? ('命中 ' + items.length + ' 条') : '没有检索到结果', items: items };
     } catch (e) {
       const err: Error = e as Error;
@@ -116,9 +139,11 @@ export class WebSearch {
     const parts: string[] = [];
     for (let i = 0; i < items.length; i++) {
       const it: SearchItem = items[i];
-      parts.push((i + 1) + '. ' + it.title + '\n   ' + it.snippet);
+      const timeTag: string = it.published === '' ? '' : ('（' + it.published + '）');
+      parts.push((i + 1) + '. ' + it.title + timeTag + '\n   ' + it.snippet);
     }
-    return '以下是从网上检索到的资料（请据此回答，不要编造资料里没有的内容）：\n' + parts.join('\n');
+    return '以下是从网上检索到的资料（括号里是发布时间，请据此回答；'
+      + '资料里没有的内容不要编造，也不要拿旧数据当现在的数据）：\n' + parts.join('\n');
   }
 
   /** 纯文本结果（用于直接展示给用户，比如技能场景） */
@@ -129,7 +154,8 @@ export class WebSearch {
     const parts: string[] = [];
     for (let i = 0; i < items.length; i++) {
       const it: SearchItem = items[i];
-      parts.push((i + 1) + '. ' + it.title + '\n' + it.snippet + (it.url !== '' ? '\n' + it.url : ''));
+      const timeTag: string = it.published === '' ? '' : ('  ' + it.published);
+      parts.push((i + 1) + '. ' + it.title + timeTag + '\n' + it.snippet + (it.url !== '' ? '\n' + it.url : ''));
     }
     return parts.join('\n\n');
   }

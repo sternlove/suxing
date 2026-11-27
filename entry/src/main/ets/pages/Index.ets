@@ -3062,7 +3062,8 @@ struct Index {
     }
     this.status = '🔍 检索中…';
     await this.nextFrame();
-    const out: SearchOutcome = await WebSearch.query(this.searchUrl, keyword);
+    // 默认只看近一周：用户反馈「有时出来几天前的」，SearXNG 默认按相关性不按时间
+    const out: SearchOutcome = await WebSearch.query(this.searchUrl, keyword, 'week');
     if (!out.ok) {
       this.status = '搜索失败：' + out.message;
       this.searchProbe = out.message;
